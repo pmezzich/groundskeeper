@@ -1,115 +1,124 @@
-# Groundskeeper — skills enforcement for salesagent
+# Groundskeeper - skills enforcement for salesagent
 
-**TL;DR:** a review agent that compiles the repo's own `.claude/rules` into an executable
-ruleset and judges PR diffs against it — "CI built against the skills." Benchmarked against
-16 merged PRs using the human reviews as ground truth: **~39% recall at ~85% precision**,
-validated on held-out PRs. The two bots already commenting on the repo scored **0%** on the
-same PRs. Built as a prototype to give the "what should this look like" discussion real data.
+Quick summary: I built a review agent that compiles the repo's `.claude/rules` into an
+actual ruleset and checks PR diffs against it. Basically CI built against the skills.
+I benchmarked it on 16 merged PRs using the human reviews as ground truth and got
+roughly 39% recall at ~85% precision, validated on held-out PRs the rules were never
+derived from. The two bots already commenting on the repo scored 0% on the same PRs.
 
----
+This is a prototype meant to give the "what should this look like" discussion real data,
+not a finished thing.
 
-## Why
+## Why I built it this way
 
-Rules/skills in `.claude/` are instructions, not enforcement — nothing verifies an agent
-(or human) actually followed them. salesagent already has 5 enforcement layers (CI,
-pre-commit, structural guard tests, Makefile gates, rules files); the rules layer is the
-only one that's words-only. Groundskeeper makes it executable, and because it compiles the
-repo's own rule files, docs and enforcement can't drift — the docs *are* the ruleset.
+The rules files are instructions, nothing checks that they actually get followed.
+salesagent already has CI, pre-commit, the structural guard tests, the Makefile gates,
+and the rules files. The rules layer is the only one that's words-only. Since this
+compiles the repo's own rule files, the docs and the enforcement can't drift apart,
+the docs are the ruleset. No per-repo config to maintain.
 
-## How it works
+## Pipeline
 
-```
-PR opened/updated
-  └─ fetch diff (supports --first-review: judge the diff a reviewer actually saw)
-  └─ compile rules from .claude/rules at the BASE ref   ← a PR can't edit rules to pass itself
-  └─ layer 1: deterministic checks (no LLM, free)        ← ratchet/baseline bumps, test skips,
-                                                            type-ignore policy, CI weakening,
-                                                            guard tampering, job timeouts
-  └─ layer 2: LLM judge per rule group                   ← rule text + WRONG/CORRECT examples
-                                                            + only the relevant hunks; strict
-                                                            JSON verdicts (pass/violation/
-                                                            not_applicable/uncertain + file:line)
-  └─ report: compliance table (console / markdown / PR comment)
-```
+1. Fetch the PR diff. There's a `--first-review` flag that judges the diff as it stood
+   at the first human review, which matters for benchmarking (later commits already
+   contain the fixes reviewers asked for).
+2. Compile rules from `.claude/rules` at the BASE ref, not the PR head, so a PR can't
+   edit the rules to pass itself. PRs that touch the rules dir get flagged separately.
+3. Deterministic checks first, no LLM involved: baseline/ratchet bumps, new test
+   skips/xfails, new type-ignores, CI weakening (`-k not`, `--deselect`, `|| true` on
+   test commands), guard-file tampering, missing job timeouts. These are free and
+   they're the part that can run today with no API key.
+4. LLM judge for the semantic rules. Each rule group gets the rule text with its
+   WRONG/CORRECT examples plus only the relevant hunks. Output is a strict JSON verdict
+   per rule (pass / violation / not_applicable / uncertain, with file:line evidence).
+   The judge never sees the PR title or description on purpose, so the author's framing
+   can't bias verdicts. I took that idea from pr-agents, along with pre-digesting input
+   instead of dumping raw patches.
+5. Output is a compliance table (console, markdown, or posted as a PR comment).
 
-Design rules carried over from pr-agents: the judge never sees the PR title/description
-(author claims can't bias verdicts), input is pre-digested hunks (never raw full patches),
-per-group failures degrade to `uncertain` rather than killing the run.
+## Mining the review history
 
-## Trained off the reviewer feedback
+This is the "trained off the reviewer feedback" part. I pulled all 429 human review
+comments across 34 merged PRs (everything except a held-out test set), generalized them
+into recurring patterns, and added 33 new rules to the corpus. Kept everything that
+showed up in 2+ different PRs plus a few mechanical one-offs.
 
-Mined **429 human review comments across 34 merged PRs** (all of repo history except a
-held-out test set) → 93 raw finding shapes → distilled to 40 → **33 added to the corpus**
-(every shape recurring in 2+ PRs, plus mechanical single-PR ones). Top recurring shapes:
+The recurrence counts were the interesting part:
 
-| Mined rule | Distinct PRs where humans flagged it |
+| mined rule | distinct PRs where a human flagged it |
 |---|---|
-| single fact/mapping encoded in one place | 7 |
-| every parallel path applies the same guards (authz/scoping) | 5 |
-| sibling structures stay symmetric (or document the outlier) | 5 |
-| new canonical helper adopted at every call site, same PR | 4 |
-| tests must exercise the production path | 4 |
-| no silent no-op degradation | 4 |
+| same fact/mapping encoded in multiple places | 7 |
+| parallel paths to a resource missing the guards their siblings have | 5 |
+| sibling structures asymmetric with no comment explaining why | 5 |
+| new canonical helper not adopted at every call site in the same PR | 4 |
+| tests that never invoke the production code path | 4 |
+| silent no-op degradation instead of rejecting | 4 |
 
-Corpus is now ~70 rules. Every future human review comment the bot misses is a new rule
-candidate — the corpus compounds with normal review activity.
+These are the things you and Konstantin keep re-explaining by hand. Corpus is ~70 rules
+now, and every future review comment the bot misses is a candidate rule, so it compounds
+with normal review activity.
 
-## The numbers
+## Numbers
 
-**Methodology:** judge the diff as of the *first human review commit* (later heads already
-contain the fixes), score against actionable human review comments visible in that diff,
-strict same-issue-same-location matching, precision judged as "would a maintainer act on or
-acknowledge this." Held-out = PRs never used to derive or calibrate any rule.
+Methodology: judge the diff as of the first human review commit, score against the
+actionable human comments whose issue is actually visible in that diff, strict matching
+(same issue, same location, vague topical overlap doesn't count). Precision = would a
+maintainer act on or at least acknowledge the finding. Held-out = PRs never used to
+derive or calibrate anything.
 
-| Eval | Recall vs human reviewers | Precision |
+| eval | recall vs human reviewers | precision |
 |---|---|---|
-| In-sample (5 PRs) | 40% | 85% |
-| Held-out set A (6 PRs) | 39% | 87% |
-| **Held-out set B, after mining (5 PRs)** | **39%** | **81%** |
-| github-code-quality[bot] (same 16 PRs) | 0% | ~13% (12 of 15 comments were alembic-boilerplate FPs) |
-| github-advanced-security[bot] (same 16 PRs) | 0% | 2 comments total |
+| in-sample (5 PRs) | 40% | 85% |
+| held-out set A (6 PRs) | 39% | 87% |
+| held-out set B, after mining (5 PRs) | 39% | 81% |
+| github-code-quality bot, same 16 PRs | 0% | ~13% (12 of its 15 comments were alembic boilerplate FPs) |
+| github-advanced-security bot, same 16 PRs | 0% | 2 comments total |
 
-The ~39% is stable across three independent test sets — it's the measured ceiling of
-diff-scoped judging, not a lucky run. Denominator context: that's recall against
-*everything senior reviewers caught across multi-round reviews*. Most PRs currently get
-zero human review; on those, this is coverage vs nothing.
+The 39% held across three separate test sets, so I'm fairly confident it's the real
+ceiling for diff-scoped judging rather than a lucky run. For context on the denominator:
+that's recall against everything senior reviewers caught across multi-round reviews. And
+most PRs currently get no human review at all, so on those it's coverage vs nothing.
 
-## Held-out case studies
+## Held-out examples worth looking at
 
-- **#1200** — mined rule "canonical helper adopted at every call site" flagged
-  `tests/conftest_db.py:401`; the maintainer's final CHANGES_REQUESTED review flagged the
-  identical line. Rule was derived from other PRs entirely.
-- **#1379** — "gate must actually run" caught the bdd-shard `mapfile` silent-failure path
-  (empty argv → pytest silently collects everything) at first review. It was explicitly
-  mis-verified as safe in review and flagged by a human 7 days later.
-- **#1372** — deterministic concurrency-group check reproduced the #1 pre-merge fix;
-  inverted-deps rule caught the seed of PAT-01 a full review round before the human.
-- **#1306** — flagged the `xfail strict=False` silencing the only E2E lifecycle test; the
-  merged head regressed back to `strict=False` *after* review demanded strict=True — still
-  live in main when measured.
-- It also surfaces valid issues humans missed (e.g. an internal-tool-ID FIXME violation on
-  #1176, log-injection sites on #1389 that no human or bot flagged at first review).
+- #1200: the "canonical helper adopted at every call site" rule (mined from other PRs
+  entirely) flagged tests/conftest_db.py:401. Konstantin's final CHANGES_REQUESTED
+  review flagged the same line.
+- #1379: the "gate must actually run" rule caught the bdd-shard mapfile silent-failure
+  path (empty argv -> pytest quietly collects the whole tree) at first review. It got
+  mis-verified as safe in review and you flagged it as your #1 hardening item 7 days
+  later.
+- #1372: the deterministic concurrency-group check matched the #1 pre-merge fix, and
+  the inverted-deps rule caught the seed of PAT-01 a review round before the human did.
+- #1306: flagged the xfail strict=False that silences the only E2E lifecycle test. The
+  merged head actually regressed back to strict=False after review asked for
+  strict=True, and it was still like that on main when I measured.
+- It also finds valid stuff humans didn't flag (an internal-tool-ID FIXME on #1176,
+  raw buyer-controlled IDs going into logger.debug on #1389).
 
-## Honest caveats
+## Caveats, being upfront
 
-- **The semantic judge layer is currently simulated** (Claude agents running the same rules
-  and prompts the API judge would use). The deterministic layer runs today, keyless. Making
-  the 39% real in CI needs an `ANTHROPIC_API_KEY` repo secret (~$0.50–1/PR with caching).
-- Remaining misses cluster in cross-file dataflow and repo/dependency knowledge — fixable
-  with full-file context for the judge (the next architecture step, also key-gated), but a
-  diff-scoped bot will never catch what's outside the diff.
-- Scoring has judgment in it (what counts as "actionable", "covered"). The methodology was
-  held constant across rounds and erred strict; happy to walk through any individual call.
+- The deterministic layer runs today, keyless. The LLM judge layer needs an
+  ANTHROPIC_API_KEY to run for real. For the benchmarks I ran the judging through
+  claude locally with the same rules and prompts the API version uses, so the 39% is
+  what the judge architecture produces, but it's not yet what the unattended CLI
+  produces. Cost with prompt caching should land around $0.50-1 per PR.
+- The misses cluster in cross-file dataflow and repo/dependency knowledge. Full-file
+  context for the judge is the next step and should help, but a diff-scoped bot is
+  never going to catch a bug that lives outside the diff.
+- Scoring this kind of thing involves judgment calls on what counts as actionable and
+  covered. I held the methodology constant across rounds and erred strict. Happy to
+  walk through any individual call.
 
-## Open questions (the "what should this look like" discussion)
+## Open questions for when we talk
 
-1. **Simple audit agent vs CI check** — the layers map to both: the deterministic layer IS
-   the simple audit agent (free, zero-key, near-zero FP); the judge layer is where recall
-   comes from. They can ship independently — e.g. det layer as a check run now, judge
-   advisory-only behind a key.
-2. **Gate policy** — start `neutral`/advisory (like ruff/CodeQL's ramp-up here), graduate
-   individual rules to blocking as their precision is proven per-rule?
-3. **Where it lives** — in-repo (`tools/` + workflow, secrets-simple) vs standalone repo
-   (reusable across prebid, relevant to the harness open-sourcing decision).
-4. **Rule corpus governance** — mined rules currently live with the tool; which belong
-   upstream in `.claude/rules` (PR #1371 is the start of that)?
+1. Simple audit agent vs CI check: the layers map onto both. The deterministic layer
+   basically is the simple audit agent (free, no key, near-zero FPs). The judge layer
+   is where the recall comes from. They could ship independently.
+2. Gate policy: start neutral/advisory like ruff and CodeQL did here, then graduate
+   individual rules to blocking as their precision gets proven?
+3. Where it lives: in-repo (tools/ + workflow, simplest for secrets) vs a standalone
+   repo other prebid repos could use. Probably tied to the harness open-sourcing
+   question.
+4. Rule corpus governance: the mined rules currently live with the tool. Which ones
+   belong upstream in .claude/rules? (#1371 was the start of that.)
