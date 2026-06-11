@@ -4,7 +4,9 @@ Quick summary: I built a review agent that compiles the repo's `.claude/rules` i
 actual ruleset and checks PR diffs against it. Basically CI built against the skills.
 I benchmarked it on 16 merged PRs using the human reviews as ground truth and got
 roughly 39% recall at ~85% precision, validated on held-out PRs the rules were never
-derived from. The two bots already commenting on the repo scored 0% on the same PRs.
+derived from. For comparison, the two bots recently added to the repo (code-quality /
+advanced-security) haven't yet covered a single human-flagged issue on the PRs where
+they were active, though they're new enough that the sample is small.
 
 This is a prototype meant to give the "what should this look like" discussion real data,
 not a finished thing.
@@ -71,8 +73,14 @@ derive or calibrate anything.
 | in-sample (5 PRs) | 40% | 85% |
 | held-out set A (6 PRs) | 39% | 87% |
 | held-out set B, after mining (5 PRs) | 39% | 81% |
-| github-code-quality bot, same 16 PRs | 0% | ~13% (12 of its 15 comments were alembic boilerplate FPs) |
-| github-advanced-security bot, same 16 PRs | 0% | 2 comments total |
+
+On the bot comparison, I have to scope it honestly: code-quality and advanced-security
+are recent additions (first comments June 10 and May 22 respectively), so they simply
+weren't active on most of the benchmark PRs. On the PRs where they were active (#1389,
+#1312), they covered 0 of the human-flagged issues, and 12 of code-quality's 14
+comments on #1312 were "unused global variable" FPs on alembic revision boilerplate.
+I only counted PR comments, not security-tab alerts. Small sample, but so far their
+inline signal hasn't overlapped with anything a human reviewer flagged.
 
 The 39% held across three separate test sets, so I'm fairly confident it's the real
 ceiling for diff-scoped judging rather than a lucky run. For context on the denominator:
