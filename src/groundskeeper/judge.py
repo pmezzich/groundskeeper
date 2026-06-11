@@ -48,7 +48,17 @@ Verdict discipline:
 - Do not report style nits the rules don't cover.
 - Report every genuine violation, even low-confidence ones, as "uncertain"
   rather than silently dropping them — a downstream filter handles ranking.
-- evidence must be the exact "path:line" of an added line you were shown."""
+- evidence must be the exact "path:line" of an added line you were shown.
+
+Justification-comment policy (calibrated against review history):
+- A comment EXCUSES a deviation only when it cites a tracked external
+  obligation: a GitHub issue (#NNNN), a spec section, or an SDK/version
+  constraint with a stated revisit condition.
+- A comment that merely EXPLAINS the deviation — "matches existing
+  patterns", "consistent with the file", "will clean up later" with no
+  issue link — does NOT excuse it. Existing debt is not a template;
+  report these as violations.
+- When unsure which kind a comment is, return "uncertain", never "pass"."""
 
 
 def rule_applies(rule: Rule, path: str) -> bool:
