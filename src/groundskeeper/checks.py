@@ -48,24 +48,44 @@ def _finding(
     )
 
 
-def _moved_lines(file: FileDiff) -> set[str]:
-    """Stripped content of removed lines — an added line matching one of
-    these was moved or re-indented, not newly introduced."""
-    return {line.strip() for line in file.removed_lines if line.strip()}
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def _moved_or_reflowed(file: FileDiff, content: str) -> bool:
+    """True when the added line was moved, re-indented, or reflowed (line
+    wrapping changed) rather than newly introduced — its whitespace-collapsed
+    content matches or is contained in a removed line (or vice versa)."""
+    norm = _normalize(content)
+    if not norm:
+        return False
+    for removed in file.removed_lines:
+        rnorm = _normalize(removed)
+        if not rnorm:
+            continue
+        if norm == rnorm or (len(norm) > 20 and (norm in rnorm or rnorm in norm)):
+            return True
+    return False
 
 
 def _has_justification_above(file: FileDiff, content: str) -> bool:
-    """True when a comment line sits within 3 patch lines above the added
-    line — i.e. the suppression is documented, not silent."""
+    """True when the suppression is documented — a trailing comment beyond
+    the directive itself, or a comment line within 6 patch lines above."""
+    # Trailing explanation after the directive, e.g. `x = y  # type: ignore[x]  # SDK stub gap`
+    if re.search(r"# type: ignore\[[\w,-]+\]\s*#\s*\S", content):
+        return True
     patch_lines = file.patch.splitlines()
     target = "+" + content
     for i, line in enumerate(patch_lines):
         if line == target:
-            for prev in patch_lines[max(0, i - 3) : i]:
+            for prev in patch_lines[max(0, i - 6) : i]:
                 code = prev[1:] if prev[:1] in "+- " else prev
                 if _COMMENT_RE.match(code):
                     return True
     return False
+
+
+_MOCK_ASSIGN_RE = re.compile(r"# type: ignore\[(method-assign|assignment)\]")
 
 
 def check_type_ignore_added(files: list[FileDiff]) -> list[Finding]:
@@ -73,12 +93,14 @@ def check_type_ignore_added(files: list[FileDiff]) -> list[Finding]:
     for f in files:
         if not f.path.endswith(".py"):
             continue
-        moved = _moved_lines(f)
+        is_test = "test" in f.path
         for line in f.added_lines:
             if "# type: ignore" not in line.content:
                 continue
-            if line.content.strip() in moved:
-                continue  # moved/re-indented, not a new suppression
+            if _moved_or_reflowed(f, line.content):
+                continue  # moved/re-indented/reflowed, not a new suppression
+            if is_test and _MOCK_ASSIGN_RE.search(line.content):
+                continue  # idiomatic mock method-assign in tests — repo convention
             scoped = re.search(r"# type: ignore\[[\w,-]+\]", line.content) is not None
             justified = _has_justification_above(f, line.content)
             if scoped and justified:
@@ -115,11 +137,10 @@ def check_test_skip_added(files: list[FileDiff]) -> list[Finding]:
     for f in files:
         if "test" not in f.path:
             continue
-        moved = _moved_lines(f)
         for line in f.added_lines:
             if not skip_re.search(line.content):
                 continue
-            if line.content.strip() in moved:
+            if _moved_or_reflowed(f, line.content):
                 continue
             documented = "reason=" in line.content or _has_justification_above(f, line.content)
             if documented:
@@ -158,9 +179,8 @@ def check_ci_weakening(files: list[FileDiff]) -> list[Finding]:
     for f in files:
         if not _CI_FILE_RE.search(f.path):
             continue
-        moved = _moved_lines(f)
         for line in f.added_lines:
-            if line.content.strip() in moved:
+            if _moved_or_reflowed(f, line.content):
                 continue
             is_deselect = deselect_re.search(line.content)
             # `|| true` is only weakening when it suppresses a test/quality
@@ -220,11 +240,12 @@ def check_guard_file_touched(files: list[FileDiff]) -> list[Finding]:
     for f in files:
         if "test_architecture_" not in f.path:
             continue
-        moved = _moved_lines(f)
+        if f.status == "added":
+            continue  # a PR INTRODUCING a guard isn't tampering with one
         cap_lines = [
             line
             for line in f.added_lines
-            if cap_re.search(line.content) and line.content.strip() not in moved
+            if cap_re.search(line.content) and not _moved_or_reflowed(f, line.content)
         ]
         if cap_lines:
             findings.append(
@@ -262,6 +283,117 @@ def check_rules_modified(files: list[FileDiff]) -> list[Finding]:
     return findings
 
 
+_NUM_RE = re.compile(r"-?\d+")
+
+
+def _baseline_values(lines: list[str]) -> dict[str, int]:
+    """Map each line's non-numeric part (the 'key') to its numeric value, so
+    both bare-number ratchets (`60`) and JSON-ish ones (`"tests": 100,`) work."""
+    values: dict[str, int] = {}
+    for line in lines:
+        m = _NUM_RE.search(line)
+        if not m:
+            continue
+        key = _NUM_RE.sub("", line).strip().strip('",:{}')
+        values[key] = int(m.group())
+    return values
+
+
+def check_ratchet_increased(files: list[FileDiff]) -> list[Finding]:
+    """Baseline/ratchet files (.type-ignore-baseline, .duplication-baseline, …)
+    may only shrink. A hand-raised ratchet — numeric value bumped up, or new
+    entries added — is a top reviewer finding when it happens."""
+    findings = []
+    for f in files:
+        name = f.path.rsplit("/", 1)[-1].lower()
+        if "baseline" not in name and "ratchet" not in name:
+            continue
+        before = _baseline_values(f.removed_lines)
+        after = _baseline_values([line.content for line in f.added_lines])
+        grew = {
+            key: (before[key], val)
+            for key, val in after.items()
+            if key in before and val > before[key]
+        }
+        added_count = sum(1 for line in f.added_lines if line.content.strip())
+        removed_count = sum(1 for line in f.removed_lines if line.strip())
+        if grew:
+            detail = "; ".join(
+                f"{key or 'value'}: {old} -> {new}" for key, (old, new) in grew.items()
+            )
+            findings.append(
+                Finding(
+                    rule_id="det/ratchet-increased",
+                    rule_title="Ratchet/baseline raised",
+                    status=VerdictStatus.VIOLATION,
+                    severity=Severity.BLOCKING,
+                    evidence=f.path,
+                    explanation=f"Baseline raised ({detail}). Ratchet files may only shrink — "
+                    "fix the new violations instead of raising the baseline.",
+                    suggested_fix="Revert the baseline bump and fix the underlying issues.",
+                    deterministic=True,
+                )
+            )
+        elif added_count > removed_count:
+            findings.append(
+                Finding(
+                    rule_id="det/ratchet-increased",
+                    rule_title="Ratchet/baseline file grew",
+                    status=VerdictStatus.VIOLATION,
+                    severity=Severity.BLOCKING,
+                    evidence=f.path,
+                    explanation=f"Baseline gained {added_count - removed_count} net entr"
+                    f"{'y' if added_count - removed_count == 1 else 'ies'}. Ratchet files may "
+                    "only shrink — fix the new violations instead of expanding the allowlist.",
+                    suggested_fix="Remove the new baseline entries and fix the underlying issues.",
+                    deterministic=True,
+                )
+            )
+    return findings
+
+
+def check_workflow_job_hygiene(files: list[FileDiff]) -> list[Finding]:
+    """New GitHub Actions jobs without timeout-minutes hang runners on wedge;
+    new workflow files without a concurrency group stack duplicate runs."""
+    findings = []
+    for f in files:
+        if "/.github/workflows/" not in f"/{f.path}" or not f.path.endswith((".yml", ".yaml")):
+            continue
+        added_text = "\n".join(line.content for line in f.added_lines)
+        new_jobs = [
+            line for line in f.added_lines if re.match(r"\s+runs-on:", line.content)
+        ]
+        if new_jobs and "timeout-minutes" not in added_text:
+            findings.append(
+                Finding(
+                    rule_id="det/job-timeout-missing",
+                    rule_title="New CI job(s) without timeout-minutes",
+                    status=VerdictStatus.UNCERTAIN,
+                    severity=Severity.NOTE,
+                    evidence=f"{f.path}:{new_jobs[0].line_number}",
+                    explanation=f"{len(new_jobs)} new job(s) added with no timeout-minutes in the "
+                    "diff — a wedged step holds the runner for GitHub's 6-hour default.",
+                    suggested_fix="Add `timeout-minutes:` to each new job.",
+                    deterministic=True,
+                )
+            )
+        if f.status == "added" and "concurrency" not in added_text:
+            findings.append(
+                Finding(
+                    rule_id="det/workflow-no-concurrency",
+                    rule_title="New workflow without concurrency group",
+                    status=VerdictStatus.UNCERTAIN,
+                    severity=Severity.NOTE,
+                    evidence=f.path,
+                    explanation="New workflow file has no `concurrency:` group — pushes in quick "
+                    "succession will stack duplicate runs.",
+                    suggested_fix="Add a concurrency group keyed on the ref, with cancel-in-progress.",
+                    deterministic=True,
+                )
+            )
+    return findings
+
+
 ALL_CHECKS = [
     check_type_ignore_added,
     check_test_skip_added,
@@ -269,6 +401,8 @@ ALL_CHECKS = [
     check_fixme_deleted,
     check_guard_file_touched,
     check_rules_modified,
+    check_ratchet_increased,
+    check_workflow_job_hygiene,
 ]
 
 

@@ -31,25 +31,35 @@ DEFAULT_REPO = "prebid/salesagent"
 DEFAULT_RULES_PATH = ".claude/rules/patterns"
 
 
+BUNDLED_RULES_DIR = Path(__file__).resolve().parent.parent.parent / "rules"
+
+
 def _load_rules(args: argparse.Namespace, token: str, base_ref: str, repo: str) -> list[Rule]:
-    """Local --rules-dir wins; otherwise fetch rule files from the PR's BASE ref."""
+    """Local --rules-dir(s) win; otherwise fetch rule files from the PR's BASE
+    ref. Groundskeeper's bundled supplementary rules are always appended."""
+    rules: list[Rule] = []
     if args.rules_dir:
-        rules = compile_rules_dir(Path(args.rules_dir))
+        for rules_dir in args.rules_dir:
+            rules.extend(compile_rules_dir(Path(rules_dir)))
         if not rules:
             console.print(f"[red]No rules found under {args.rules_dir}[/red]")
             sys.exit(1)
-        return rules
+    else:
+        contents = github.fetch_rules_from_base(repo, base_ref, token, DEFAULT_RULES_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in contents.items():
+                p = Path(tmp) / name
+                p.write_text(text, encoding="utf-8")
+                rules.extend(compile_rules_file(p, source_label=name))
+        if not rules:
+            console.print(f"[red]No rule files found at {repo}@{base_ref}:{DEFAULT_RULES_PATH}[/red]")
+            sys.exit(1)
 
-    contents = github.fetch_rules_from_base(repo, base_ref, token, DEFAULT_RULES_PATH)
-    rules: list[Rule] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, text in contents.items():
-            p = Path(tmp) / name
-            p.write_text(text, encoding="utf-8")
-            rules.extend(compile_rules_file(p, source_label=name))
-    if not rules:
-        console.print(f"[red]No rule files found at {repo}@{base_ref}:{DEFAULT_RULES_PATH}[/red]")
-        sys.exit(1)
+    if BUNDLED_RULES_DIR.is_dir():
+        seen = {r.id for r in rules}
+        for rule in compile_rules_dir(BUNDLED_RULES_DIR):
+            if rule.id not in seen:
+                rules.append(rule)
     return rules
 
 
@@ -176,7 +186,11 @@ def main() -> None:
     review = sub.add_parser("review", help="Review a PR against the repo's rules")
     review.add_argument("pr", help="PR number or full URL")
     review.add_argument("--repo", default=DEFAULT_REPO)
-    review.add_argument("--rules-dir", help="Local rules dir (overrides base-ref fetch)")
+    review.add_argument(
+        "--rules-dir",
+        action="append",
+        help="Local rules dir (repeatable; overrides base-ref fetch)",
+    )
     review.add_argument("--no-llm", action="store_true", help="Deterministic checks only")
     review.add_argument("--output", help="Save markdown report to this path")
     review.add_argument("--post", action="store_true", help="Post report as a PR comment")
@@ -195,7 +209,7 @@ def main() -> None:
     bench = sub.add_parser("benchmark", help="Measure recall vs human review on a PR")
     bench.add_argument("pr", help="PR number or full URL")
     bench.add_argument("--repo", default=DEFAULT_REPO)
-    bench.add_argument("--rules-dir")
+    bench.add_argument("--rules-dir", action="append")
     bench.add_argument("--no-llm", action="store_true")
     bench.add_argument("--at-commit")
     bench.add_argument("--first-review", action="store_true", default=True)

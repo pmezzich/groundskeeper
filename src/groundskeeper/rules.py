@@ -17,7 +17,10 @@ from groundskeeper.models import Rule, Severity
 
 # Maps rule-file name patterns to the file globs their rules apply to.
 # A rule only reaches the judge when the PR touches a matching file.
+# Order matters: first keyword match wins.
 _DEFAULT_APPLICABILITY: dict[str, list[str]] = {
+    "ci-": [".github/workflows/**", "Makefile", "tox.ini", "scripts/**", "*.sh", "*baseline*"],
+    "src-": ["src/**", "scripts/**"],
     "test": ["tests/**", "test_*", "*_test.py", "conftest.py"],
     "code": ["src/**", "scripts/**", "*.py"],
     "mcp": ["src/**"],
