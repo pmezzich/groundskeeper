@@ -54,7 +54,7 @@ The recurrence counts were the interesting part:
 | tests that never invoke the production code path | 4 |
 | silent no-op degradation instead of rejecting | 4 |
 
-These are the things you and Konstantin keep re-explaining by hand. Corpus is ~70 rules
+These are the things you and Constantine keep re-explaining by hand. Corpus is ~70 rules
 now, and every future review comment the bot misses is a candidate rule, so it compounds
 with normal review activity.
 
@@ -82,7 +82,7 @@ most PRs currently get no human review at all, so on those it's coverage vs noth
 ## Held-out examples worth looking at
 
 - #1200: the "canonical helper adopted at every call site" rule (mined from other PRs
-  entirely) flagged tests/conftest_db.py:401. Konstantin's final CHANGES_REQUESTED
+  entirely) flagged tests/conftest_db.py:401. Constantine's final CHANGES_REQUESTED
   review flagged the same line.
 - #1379: the "gate must actually run" rule caught the bdd-shard mapfile silent-failure
   path (empty argv -> pytest quietly collects the whole tree) at first review. It got
