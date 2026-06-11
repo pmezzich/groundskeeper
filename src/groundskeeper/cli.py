@@ -58,7 +58,17 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding]]:
     repo, number = github.parse_pr_ref(args.pr, args.repo)
 
     console.print(f"[bold]Fetching {repo}#{number}…[/bold]")
-    pr = github.fetch_pull_request(repo, number, token)
+    at_commit = getattr(args, "at_commit", None)
+    if getattr(args, "first_review", False):
+        at_commit = github.resolve_first_review_commit(repo, number, token)
+        if at_commit:
+            console.print(f"  first human review was at commit {at_commit[:10]}")
+        else:
+            console.print("[yellow]  no human review found — using current head[/yellow]")
+    if at_commit:
+        pr = github.fetch_pull_request_at_commit(repo, number, at_commit, token)
+    else:
+        pr = github.fetch_pull_request(repo, number, token)
     console.print(f"  {len(pr.files)} changed files, base={pr.base_ref}")
 
     rules = _load_rules(args, token, pr.base_ref, repo)
@@ -170,6 +180,12 @@ def main() -> None:
     review.add_argument("--no-llm", action="store_true", help="Deterministic checks only")
     review.add_argument("--output", help="Save markdown report to this path")
     review.add_argument("--post", action="store_true", help="Post report as a PR comment")
+    review.add_argument("--at-commit", help="Judge the diff as of this head SHA (compare vs base)")
+    review.add_argument(
+        "--first-review",
+        action="store_true",
+        help="Judge the diff the first human review saw (benchmark mode)",
+    )
 
     rules_p = sub.add_parser("rules", help="List compiled rules")
     rules_p.add_argument("--repo", default=DEFAULT_REPO)
@@ -181,6 +197,8 @@ def main() -> None:
     bench.add_argument("--repo", default=DEFAULT_REPO)
     bench.add_argument("--rules-dir")
     bench.add_argument("--no-llm", action="store_true")
+    bench.add_argument("--at-commit")
+    bench.add_argument("--first-review", action="store_true", default=True)
 
     args = parser.parse_args()
     logging.basicConfig(
