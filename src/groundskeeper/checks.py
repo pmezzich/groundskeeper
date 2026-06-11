@@ -206,17 +206,27 @@ def check_fixme_deleted(files: list[FileDiff]) -> list[Finding]:
     new tag added on the same code) is not a deletion."""
     fixme_re = re.compile(r"FIXME\(([\w#-]+)\)")
     findings = []
+    seen_tags: set[str] = set()
     for f in files:
+        if f.status == "removed":
+            continue  # whole file deleted — the FIXME's subject is gone with it
         removed_count = sum(1 for line in f.removed_lines if fixme_re.search(line))
         added_count = sum(1 for line in f.added_lines if fixme_re.search(line.content))
-        if removed_count > added_count:
+        # A diff that substantially rewrites the code around a removed FIXME
+        # most likely completed the tracked work — only flag near-pure deletions.
+        substantive_edit = len(f.added_lines) > 3 * max(removed_count, 1)
+        if removed_count > added_count and not substantive_edit:
             removed_tags = {
                 m.group(1) for line in f.removed_lines for m in [fixme_re.search(line)] if m
             }
             added_tags = {
                 m.group(1) for line in f.added_lines for m in [fixme_re.search(line.content)] if m
             }
-            gone = ", ".join(sorted(removed_tags - added_tags)) or "unknown"
+            new_gone = (removed_tags - added_tags) - seen_tags
+            if not new_gone:
+                continue  # already reported these tags from another file
+            seen_tags.update(new_gone)
+            gone = ", ".join(sorted(new_gone))
             findings.append(
                 Finding(
                     rule_id="det/fixme-deleted",
@@ -308,6 +318,8 @@ def check_ratchet_increased(files: list[FileDiff]) -> list[Finding]:
         name = f.path.rsplit("/", 1)[-1].lower()
         if "baseline" not in name and "ratchet" not in name:
             continue
+        if f.status == "added":
+            continue  # creating a new baseline IS the gate being introduced
         before = _baseline_values(f.removed_lines)
         after = _baseline_values([line.content for line in f.added_lines])
         grew = {

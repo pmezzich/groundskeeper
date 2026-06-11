@@ -60,6 +60,26 @@ tox -e $(echo "$ENVS" | tr ',' ' ')
 [ -n "$ENVS" ] || { echo "no envs computed"; exit 1; }
 ```
 
+## No Stale References
+
+Comments, step names, docs, and config keys must point at things that exist
+in the code as of this diff. Stale references actively mislead the next reader.
+
+Check every added comment/doc line that names a concrete target:
+
+- A comment referencing a CI job, env var, file, or function — does that
+  target exist (in the diff or the repo)?
+- A workflow step `name:` — does it describe what the step now does?
+- A doc claim ("we run pip-audit", "bumped to >=3.3.1") — does the adjacent
+  config actually do/say that?
+- Env vars set but never read (or read but never set) within the diff's scope
+
+```yaml
+# WRONG — step renamed but the comment still points at a job that never existed
+# storyboard results feed the verify-storyboard job
+- name: Run pre-commit   # ...step actually runs the test matrix
+```
+
 ## Ratchet Files Only Shrink
 
 Baseline files (`.type-ignore-baseline`, `.duplication-baseline`, etc.) exist
