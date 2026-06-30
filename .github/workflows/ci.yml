@@ -1,0 +1,33 @@
+name: CI
+
+# Build + smoke check for groundskeeper itself (keyless, no secrets).
+# Proves the package installs and the deterministic half of the pipeline runs.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: CLI smoke
+        run: uv run groundskeeper --help
+
+      - name: Compile bundled rules (keyless)
+        run: uv run groundskeeper rules --rules-dir rules

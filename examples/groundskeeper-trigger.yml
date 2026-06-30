@@ -1,0 +1,38 @@
+# EXAMPLE — place this in a CONSUMER repo (e.g. prebid/salesagent) as
+#   .github/workflows/groundskeeper.yml
+#
+# It asks the standalone groundskeeper repo to review each PR by firing a
+# repository_dispatch event. Groundskeeper does the work (and holds the
+# ANTHROPIC_API_KEY) on its own side — this repo only needs a token that can
+# POST a dispatch.
+#
+# Required secret in THIS (consumer) repo:
+#   GROUNDSKEEPER_DISPATCH_TOKEN : a PAT with `contents:write` on <OWNER>/groundskeeper
+#                                  (just enough to POST a repository_dispatch).
+#
+# Replace <OWNER> below with wherever groundskeeper lives (e.g. pmezzich).
+
+name: Request groundskeeper review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Ask groundskeeper to review this PR
+        env:
+          GH_TOKEN: ${{ secrets.GROUNDSKEEPER_DISPATCH_TOKEN }}
+          SRC_REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/<OWNER>/groundskeeper/dispatches" --method POST \
+            -f event_type=groundskeeper-review \
+            -f "client_payload[repo]=$SRC_REPO" \
+            -f "client_payload[pr]=$PR_NUM"

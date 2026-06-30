@@ -1,0 +1,96 @@
+name: Groundskeeper review
+
+# Reviews a pull request in a TARGET repo (e.g. prebid/salesagent) against that
+# repo's own .claude/rules, and posts the compliance report as a PR comment.
+#
+# Triggers:
+#   - workflow_dispatch     : run it by hand from the Actions tab (pick repo + PR)
+#   - repository_dispatch   : fired by a consumer repo's PR (see examples/groundskeeper-trigger.yml)
+#
+# Secrets (repo or org level):
+#   - GROUNDSKEEPER_GH_TOKEN : PAT with read on the target repo + pull-requests:write to post
+#                              the comment. Falls back to the workflow token for same-repo PRs.
+#   - ANTHROPIC_API_KEY      : enables the LLM judge. If unset, the run degrades to the
+#                              keyless deterministic checks only (still posts a report).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Target repo (owner/name) whose PR to review"
+        required: true
+        default: prebid/salesagent
+      pr:
+        description: "PR number to review"
+        required: true
+      mode:
+        description: "Review depth"
+        type: choice
+        options:
+          - full
+          - deterministic-only
+        default: full
+  repository_dispatch:
+    types: [groundskeeper-review]
+
+permissions:
+  contents: read
+
+concurrency:
+  # one review per target PR at a time; newer pushes cancel an in-flight review
+  group: gk-${{ github.event.inputs.repo || github.event.client_payload.repo }}-${{ github.event.inputs.pr || github.event.client_payload.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve target PR
+        id: t
+        env:
+          # Read trigger inputs via env (never interpolate ${{ }} straight into run: scripts)
+          IN_REPO: ${{ github.event.inputs.repo || github.event.client_payload.repo || 'prebid/salesagent' }}
+          IN_PR: ${{ github.event.inputs.pr || github.event.client_payload.pr }}
+          IN_MODE: ${{ github.event.inputs.mode || github.event.client_payload.mode || 'full' }}
+        run: |
+          if [ -z "$IN_PR" ]; then
+            echo "::error::No PR number supplied (workflow_dispatch input or client_payload.pr)"
+            exit 1
+          fi
+          echo "repo=$IN_REPO" >> "$GITHUB_OUTPUT"
+          echo "pr=$IN_PR"     >> "$GITHUB_OUTPUT"
+          echo "mode=$IN_MODE" >> "$GITHUB_OUTPUT"
+          echo "Reviewing $IN_REPO#$IN_PR (mode=$IN_MODE)"
+
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install groundskeeper
+        run: uv sync --frozen
+
+      - name: Review and post
+        env:
+          GITHUB_TOKEN: ${{ secrets.GROUNDSKEEPER_GH_TOKEN || github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO: ${{ steps.t.outputs.repo }}
+          PR: ${{ steps.t.outputs.pr }}
+          MODE: ${{ steps.t.outputs.mode }}
+        run: |
+          ARGS="review $PR --repo $REPO --post --output report.md"
+          if [ "$MODE" = "deterministic-only" ]; then
+            ARGS="$ARGS --no-llm"
+          fi
+          uv run groundskeeper $ARGS
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: groundskeeper-report-${{ steps.t.outputs.pr }}
+          path: report.md
+          if-no-files-found: ignore
