@@ -143,15 +143,18 @@ def _judge_via_cli(system_text: str, user_text: str) -> JudgeResponse | None:
     try:
         # Prompt goes on STDIN, not argv: the rules+hunks prompt routinely
         # exceeds the OS command-line length limit (~32 KB on Windows), which
-        # would truncate or fail an argv-passed prompt.
+        # would truncate or fail an argv-passed prompt. Force UTF-8 so unicode
+        # in rules/diffs (arrows, em-dashes) can't hit the Windows cp1252 codec.
         proc = subprocess.run(
             [claude, "-p", "--output-format", "json", "--model", MODEL],
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("claude CLI judge call failed: %s", exc)
         return None
     if proc.returncode != 0:
