@@ -78,6 +78,16 @@ groundskeeper review <pr> --repo prebid/prebid-mobile-android \
 `--rules-dir mobile/rules` is required because the mobile repos don't ship a
 `.claude/rules` dir — the corpus lives here until (if) it moves in-repo.
 
+## Does it work? — benchmark
+
+Benchmarked the mined rules against real reviewed PRs (recall vs the actual
+human review comments), same method as salesagent. Headline: the corpus
+reliably catches asks that fall **within** its 17 patterns (Android held-out
+3/3 first-commit; iOS in-sample 9/10), but **under-covers logic bugs outside
+them** (iOS held-out: only 2/9 reviewer asks mapped to a rule). The limiter is
+corpus breadth, not the judge — the early-stage shape salesagent had. Full
+numbers + caveats: [`BENCHMARK.md`](BENCHMARK.md).
+
 ## Honest caveats
 
 - **Review history is thin and maintainer-gated.** Usable signal came from
