@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 
-from groundskeeper.models import Finding, FileDiff, Severity, VerdictStatus
+from groundskeeper.models import FileDiff, Finding, Severity, VerdictStatus
 
 _CI_FILE_RE = re.compile(r"(\.github/workflows/|Makefile|tox\.ini|run_all_tests|\.pre-commit)")
 _TEST_INVOCATION_RE = re.compile(r"pytest|tox\b|make\s+\S*test|run_all_tests|coverage|mypy|ruff")
@@ -216,12 +216,8 @@ def check_fixme_deleted(files: list[FileDiff]) -> list[Finding]:
         # most likely completed the tracked work — only flag near-pure deletions.
         substantive_edit = len(f.added_lines) > 3 * max(removed_count, 1)
         if removed_count > added_count and not substantive_edit:
-            removed_tags = {
-                m.group(1) for line in f.removed_lines for m in [fixme_re.search(line)] if m
-            }
-            added_tags = {
-                m.group(1) for line in f.added_lines for m in [fixme_re.search(line.content)] if m
-            }
+            removed_tags = {m.group(1) for line in f.removed_lines for m in [fixme_re.search(line)] if m}
+            added_tags = {m.group(1) for line in f.added_lines for m in [fixme_re.search(line.content)] if m}
             new_gone = (removed_tags - added_tags) - seen_tags
             if not new_gone:
                 continue  # already reported these tags from another file
@@ -322,17 +318,11 @@ def check_ratchet_increased(files: list[FileDiff]) -> list[Finding]:
             continue  # creating a new baseline IS the gate being introduced
         before = _baseline_values(f.removed_lines)
         after = _baseline_values([line.content for line in f.added_lines])
-        grew = {
-            key: (before[key], val)
-            for key, val in after.items()
-            if key in before and val > before[key]
-        }
+        grew = {key: (before[key], val) for key, val in after.items() if key in before and val > before[key]}
         added_count = sum(1 for line in f.added_lines if line.content.strip())
         removed_count = sum(1 for line in f.removed_lines if line.strip())
         if grew:
-            detail = "; ".join(
-                f"{key or 'value'}: {old} -> {new}" for key, (old, new) in grew.items()
-            )
+            detail = "; ".join(f"{key or 'value'}: {old} -> {new}" for key, (old, new) in grew.items())
             findings.append(
                 Finding(
                     rule_id="det/ratchet-increased",
@@ -372,9 +362,7 @@ def check_workflow_job_hygiene(files: list[FileDiff]) -> list[Finding]:
         if "/.github/workflows/" not in f"/{f.path}" or not f.path.endswith((".yml", ".yaml")):
             continue
         added_text = "\n".join(line.content for line in f.added_lines)
-        new_jobs = [
-            line for line in f.added_lines if re.match(r"\s+runs-on:", line.content)
-        ]
+        new_jobs = [line for line in f.added_lines if re.match(r"\s+runs-on:", line.content)]
         if new_jobs and "timeout-minutes" not in added_text:
             findings.append(
                 Finding(

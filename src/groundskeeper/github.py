@@ -132,9 +132,7 @@ def resolve_first_review_commit(repo: str, number: int, token: str) -> str | Non
                 login = r["user"]["login"]
                 if login.endswith("[bot]") or not r.get("commit_id"):
                     continue
-                if r.get("state") in ("COMMENTED", "CHANGES_REQUESTED", "APPROVED") and r.get(
-                    "submitted_at"
-                ):
+                if r.get("state") in ("COMMENTED", "CHANGES_REQUESTED", "APPROVED") and r.get("submitted_at"):
                     candidates.append((r["submitted_at"], r["commit_id"]))
         comments = client.get(
             f"{API}/repos/{repo}/pulls/{number}/comments",

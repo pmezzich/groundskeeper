@@ -42,9 +42,10 @@ def measure_recall(
     actionable_findings = [
         f for f in findings if f.status in (VerdictStatus.VIOLATION, VerdictStatus.UNCERTAIN)
     ]
-    findings_block = "\n".join(
-        f"- [{f.rule_id}] {f.evidence or ''}: {f.explanation}" for f in actionable_findings
-    ) or "(the bot produced no findings)"
+    findings_block = (
+        "\n".join(f"- [{f.rule_id}] {f.evidence or ''}: {f.explanation}" for f in actionable_findings)
+        or "(the bot produced no findings)"
+    )
     comments_block = "\n\n".join(
         f"COMMENT {i + 1} ({c['author']} on {c['path']}):\n{c['body'][:800]}"
         for i, c in enumerate(human_comments)

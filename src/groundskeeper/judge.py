@@ -19,8 +19,8 @@ import os
 import anthropic
 
 from groundskeeper.models import (
-    Finding,
     FileDiff,
+    Finding,
     JudgeResponse,
     Rule,
     VerdictStatus,

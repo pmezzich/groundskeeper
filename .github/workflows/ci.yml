@@ -1,7 +1,6 @@
 name: CI
 
-# Build + smoke check for groundskeeper itself (keyless, no secrets).
-# Proves the package installs and the deterministic half of the pipeline runs.
+# Lint + tests + keyless smoke for groundskeeper itself (no secrets, no API key).
 
 on:
   pull_request:
@@ -12,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  quality:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
@@ -25,6 +24,15 @@ jobs:
 
       - name: Install
         run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Tests
+        run: uv run pytest -q
 
       - name: CLI smoke
         run: uv run groundskeeper --help
