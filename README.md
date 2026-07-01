@@ -30,12 +30,15 @@ human-flagged issues where they were active.
 ```bash
 groundskeeper review 1371 --repo prebid/salesagent      # console report
 groundskeeper review 1371 --no-llm                      # keyless (no API key)
+groundskeeper review 1371 --judge claude-cli            # judge on a Claude subscription (no key)
 groundskeeper review 1371 --post                        # post as a PR comment
 groundskeeper rules  --repo prebid/salesagent           # list compiled rules
 groundskeeper benchmark 1389 --repo prebid/salesagent   # recall vs human review
 ```
 
-The LLM judge needs `ANTHROPIC_API_KEY`. Without it, `review` runs the
+The LLM judge runs via either the Anthropic API (`ANTHROPIC_API_KEY`, metered)
+or `claude -p` (a Claude subscription — no key, no per-token cost); pick with
+`--judge {auto,api,claude-cli}`. With neither available, `review` runs the
 deterministic checks only.
 
 ## Run it as CI
