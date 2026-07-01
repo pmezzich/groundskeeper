@@ -59,6 +59,18 @@ class PullRequest(BaseModel):
     files: list[FileDiff] = Field(default_factory=list)
 
 
+class PRRef(BaseModel):
+    """Lightweight open-PR reference for the watcher. `title` is used only for
+    the human-facing index — it is never fed to the judge (component isolation)."""
+
+    number: int
+    head_sha: str
+    draft: bool = False
+    author: str = ""
+    title: str = ""
+    url: str = ""
+
+
 class Finding(BaseModel):
     """A single check result, deterministic or LLM-judged."""
 

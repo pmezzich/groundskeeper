@@ -146,6 +146,7 @@ def _judge_via_cli(system_text: str, user_text: str) -> JudgeResponse | None:
             capture_output=True,
             text=True,
             timeout=300,
+            stdin=subprocess.DEVNULL,  # headless: don't block 3s waiting on stdin
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("claude CLI judge call failed: %s", exc)

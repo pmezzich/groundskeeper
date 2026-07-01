@@ -6,6 +6,7 @@ Usage:
     groundskeeper review 1371 --post           # post the report as a PR comment
     groundskeeper rules --repo prebid/salesagent
     groundskeeper benchmark 1389 --repo prebid/salesagent
+    groundskeeper watch --judge claude-cli        # review all open PRs (dry-run)
 """
 
 from __future__ import annotations
@@ -180,6 +181,36 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     console.print(f"\n[bold]Recall: {recall:.0%}[/bold] of human review comments covered")
 
 
+def cmd_watch(args: argparse.Namespace) -> None:
+    from groundskeeper.judge import resolve_backend
+    from groundskeeper.watch import run_watch
+
+    token = github.resolve_token()
+    backend = resolve_backend(getattr(args, "judge", None))
+    if backend is None:
+        console.print("[red]No judge backend — set ANTHROPIC_API_KEY or install the `claude` CLI.[/red]")
+        sys.exit(1)
+
+    mode = "POST (live comments)" if args.post else "dry-run (local reports)"
+    console.print(f"[bold]Watching {args.repo}[/bold] — backend: {backend}, mode: {mode}")
+    result = run_watch(
+        args.repo,
+        token,
+        backend=backend,
+        post=args.post,
+        out_dir=Path(args.out_dir),
+        state_file=Path(args.state_file),
+        include_drafts=args.include_drafts,
+        skip_authors=frozenset(args.skip_author or ()),
+        limit=args.limit,
+    )
+    tail = f", posted {result.posted}" if args.post else ""
+    console.print(f"  reviewed {len(result.reviewed)} PR(s), skipped {result.skipped}{tail}")
+    console.print(f"  reports written to [bold]{result.out_dir}[/bold] (see SUMMARY.md)")
+    if not args.post:
+        console.print("[dim]dry-run: nothing posted. Re-run with --post to go live.[/dim]")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="groundskeeper",
@@ -225,6 +256,37 @@ def main() -> None:
     bench.add_argument("--at-commit")
     bench.add_argument("--first-review", action="store_true", default=True)
 
+    watch_p = sub.add_parser("watch", help="Review a repo's open PRs; dry-run local reports or --post live")
+    watch_p.add_argument("--repo", default=DEFAULT_REPO)
+    watch_p.add_argument(
+        "--judge",
+        choices=["auto", "api", "claude-cli"],
+        default="auto",
+        help="Judge backend: 'api' or 'claude-cli' (a Claude subscription). Default: auto.",
+    )
+    watch_p.add_argument(
+        "--post",
+        action="store_true",
+        help="Post comments on the PRs (default: dry-run, local reports only)",
+    )
+    watch_p.add_argument(
+        "--out-dir",
+        default="groundskeeper-reports",
+        help="Directory for per-PR reports + SUMMARY.md",
+    )
+    watch_p.add_argument(
+        "--state-file",
+        default=".groundskeeper-state.json",
+        help="Tracks reviewed head SHAs so unchanged PRs are skipped between runs",
+    )
+    watch_p.add_argument("--limit", type=int, default=10, help="Max PRs to review per run")
+    watch_p.add_argument("--include-drafts", action="store_true", help="Also review draft PRs")
+    watch_p.add_argument(
+        "--skip-author",
+        action="append",
+        help="Skip PRs by this author, e.g. a bot (repeatable)",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -237,6 +299,8 @@ def main() -> None:
         cmd_rules(args)
     elif args.command == "benchmark":
         cmd_benchmark(args)
+    elif args.command == "watch":
+        cmd_watch(args)
     else:
         parser.print_help()
         sys.exit(1)

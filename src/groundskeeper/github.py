@@ -14,7 +14,7 @@ import subprocess
 
 import httpx
 
-from groundskeeper.models import DiffLine, FileDiff, PullRequest
+from groundskeeper.models import DiffLine, FileDiff, PRRef, PullRequest
 
 API = "https://api.github.com"
 
@@ -115,6 +115,49 @@ def fetch_pull_request(repo: str, number: int, token: str) -> PullRequest:
         head_sha=meta_data["head"]["sha"],
         files=files,
     )
+
+
+def list_open_pull_requests(repo: str, token: str) -> list[PRRef]:
+    """List open PRs (most-recently-updated first) for the watcher.
+
+    Title is fetched for the human-facing index only; it never enters the judge
+    path, which re-fetches each PR via fetch_pull_request (sans title).
+    """
+    prs: list[PRRef] = []
+    with httpx.Client(timeout=30) as client:
+        page = 1
+        while True:
+            resp = client.get(
+                f"{API}/repos/{repo}/pulls",
+                headers=_headers(token),
+                params={
+                    "state": "open",
+                    "per_page": 100,
+                    "page": page,
+                    "sort": "updated",
+                    "direction": "desc",
+                },
+            )
+            if resp.status_code != 200:
+                raise GitHubError(f"Failed to list open PRs for {repo}: HTTP {resp.status_code}")
+            batch = resp.json()
+            if not batch:
+                break
+            for pr in batch:
+                prs.append(
+                    PRRef(
+                        number=pr["number"],
+                        head_sha=pr["head"]["sha"],
+                        draft=bool(pr.get("draft", False)),
+                        author=(pr.get("user") or {}).get("login", ""),
+                        title=pr.get("title", ""),
+                        url=pr.get("html_url", ""),
+                    )
+                )
+            if len(batch) < 100:
+                break
+            page += 1
+    return prs
 
 
 def resolve_first_review_commit(repo: str, number: int, token: str) -> str | None:
