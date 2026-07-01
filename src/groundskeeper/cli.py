@@ -89,13 +89,18 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding]]:
 
     if args.no_llm:
         console.print("[yellow]--no-llm: skipping semantic judge[/yellow]")
-    elif not os.environ.get("ANTHROPIC_API_KEY"):
-        console.print("[yellow]ANTHROPIC_API_KEY not set — deterministic checks only[/yellow]")
     else:
-        from groundskeeper.judge import judge_all
+        from groundskeeper.judge import judge_all, resolve_backend
 
-        console.print("  judging semantic rules…")
-        findings.extend(judge_all(rules, pr.files))
+        backend = resolve_backend(getattr(args, "judge", None))
+        if backend is None:
+            console.print(
+                "[yellow]No judge backend — set ANTHROPIC_API_KEY or install the `claude` CLI. "
+                "Deterministic checks only.[/yellow]"
+            )
+        else:
+            console.print(f"  judging semantic rules… (backend: {backend})")
+            findings.extend(judge_all(rules, pr.files, backend=backend))
 
     return repo, number, findings
 
@@ -192,6 +197,12 @@ def main() -> None:
         help="Local rules dir (repeatable; overrides base-ref fetch)",
     )
     review.add_argument("--no-llm", action="store_true", help="Deterministic checks only")
+    review.add_argument(
+        "--judge",
+        choices=["auto", "api", "claude-cli"],
+        default="auto",
+        help="Judge backend: 'api' or 'claude-cli' (a Claude subscription). Default: auto.",
+    )
     review.add_argument("--output", help="Save markdown report to this path")
     review.add_argument("--post", action="store_true", help="Post report as a PR comment")
     review.add_argument("--at-commit", help="Judge the diff as of this head SHA (compare vs base)")

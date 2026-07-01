@@ -7,14 +7,24 @@ Design constraints (carried over from pr-agents where they earned their keep):
 - Per-group exception isolation: a failed call degrades to `uncertain`
   verdicts, never kills the run.
 - Prompt caching: instructions + rule text are the stable prefix
-  (cache_control), the per-PR hunks come after it.
+  (cache_control), the per-PR hunks come after it (api backend).
+
+Two interchangeable backends — the caller picks, or it auto-detects:
+- "api": the Anthropic API (`messages.parse` structured output). Needs
+  ANTHROPIC_API_KEY; metered per-token billing.
+- "claude-cli": shells out to `claude -p` (Claude Code). Runs on a Claude
+  subscription's usage window — no API key, no per-token cost.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 
 import anthropic
 
@@ -60,6 +70,30 @@ Justification-comment policy (calibrated against review history):
   report these as violations.
 - When unsure which kind a comment is, return "uncertain", never "pass"."""
 
+# Appended only for the claude-cli backend, which has no enforced output schema.
+_JSON_TAIL = """
+
+Respond with ONLY a JSON object of this exact shape — no prose, no code fences:
+{"verdicts": [{"rule_id": "<id>", "status": "violation|pass|not_applicable|uncertain", \
+"evidence": "path:line or null", "explanation": "<one to three sentences>", \
+"suggested_fix": "<concrete fix or null>"}]}"""
+
+
+def resolve_backend(explicit: str | None = None) -> str | None:
+    """Pick the judge backend: explicit choice > env var > auto-detect.
+
+    Returns "api", "claude-cli", or None when neither an API key nor the
+    `claude` CLI is available (caller then runs deterministic checks only).
+    """
+    choice = (explicit or os.environ.get("GROUNDSKEEPER_JUDGE_BACKEND") or "auto").strip().lower()
+    if choice in ("api", "claude-cli"):
+        return choice
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "api"
+    if shutil.which("claude"):
+        return "claude-cli"
+    return None
+
 
 def rule_applies(rule: Rule, path: str) -> bool:
     return any(
@@ -91,12 +125,71 @@ def _rules_block(rules: list[Rule]) -> str:
     )
 
 
+def _parse_judge_json(text: str) -> JudgeResponse | None:
+    """Extract and validate the verdict JSON returned by the CLI backend."""
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return JudgeResponse.model_validate_json(match.group(0))
+    except ValueError:
+        return None
+
+
+def _judge_via_cli(system_text: str, user_text: str) -> JudgeResponse | None:
+    """One judge call through `claude -p` — subscription auth, no API key."""
+    claude = shutil.which("claude") or "claude"
+    prompt = f"{system_text}{_JSON_TAIL}\n\n{user_text}"
+    try:
+        proc = subprocess.run(
+            [claude, "-p", prompt, "--output-format", "json", "--model", MODEL],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("claude CLI judge call failed: %s", exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning("claude CLI exited %d: %s", proc.returncode, proc.stderr[:300])
+        return None
+    # `--output-format json` wraps the reply in an envelope; unwrap to the text.
+    text = proc.stdout
+    try:
+        envelope = json.loads(proc.stdout)
+        if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
+            text = envelope["result"]
+    except json.JSONDecodeError:
+        pass
+    return _parse_judge_json(text)
+
+
+def _judge_via_api(client: anthropic.Anthropic, rules: list[Rule], hunks: str) -> JudgeResponse | None:
+    try:
+        response = client.messages.parse(
+            model=MODEL,
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            system=[
+                {"type": "text", "text": _JUDGE_INSTRUCTIONS, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": _rules_block(rules), "cache_control": {"type": "ephemeral"}},
+            ],
+            messages=[{"role": "user", "content": f"Diff hunks to judge:\n\n{hunks}"}],
+            output_format=JudgeResponse,
+        )
+        return response.parsed_output
+    except anthropic.APIError as exc:
+        logger.warning("Judge API call failed for group %s: %s", [r.id for r in rules], exc)
+        return None
+
+
 def judge_rule_group(
-    client: anthropic.Anthropic,
     rules: list[Rule],
     files: list[FileDiff],
+    backend: str,
+    client: anthropic.Anthropic | None = None,
 ) -> list[Finding]:
-    """One API call judging one group of rules against the relevant hunks."""
+    """Judge one group of rules against the relevant hunks, via `backend`."""
     hunks = _hunks_block(files, rules)
     if not hunks:
         return [
@@ -110,31 +203,12 @@ def judge_rule_group(
             for r in rules
         ]
 
-    rules_by_id = {r.id: r for r in rules}
-    try:
-        response = client.messages.parse(
-            model=MODEL,
-            max_tokens=16000,
-            thinking={"type": "adaptive"},
-            system=[
-                {
-                    "type": "text",
-                    "text": _JUDGE_INSTRUCTIONS,
-                    "cache_control": {"type": "ephemeral"},
-                },
-                {
-                    "type": "text",
-                    "text": _rules_block(rules),
-                    "cache_control": {"type": "ephemeral"},
-                },
-            ],
-            messages=[{"role": "user", "content": f"Diff hunks to judge:\n\n{hunks}"}],
-            output_format=JudgeResponse,
+    if backend == "claude-cli":
+        parsed = _judge_via_cli(
+            f"{_JUDGE_INSTRUCTIONS}\n\n{_rules_block(rules)}", f"Diff hunks to judge:\n\n{hunks}"
         )
-        parsed = response.parsed_output
-    except anthropic.APIError as exc:
-        logger.warning("Judge call failed for group %s: %s", [r.id for r in rules], exc)
-        parsed = None
+    else:
+        parsed = _judge_via_api(client or anthropic.Anthropic(), rules, hunks)
 
     if parsed is None:
         return [
@@ -148,6 +222,7 @@ def judge_rule_group(
             for r in rules
         ]
 
+    rules_by_id = {r.id: r for r in rules}
     findings: list[Finding] = []
     seen: set[str] = set()
     for verdict in parsed.verdicts:
@@ -181,15 +256,20 @@ def judge_rule_group(
     return findings
 
 
-def judge_all(rules: list[Rule], files: list[FileDiff]) -> list[Finding]:
+def judge_all(rules: list[Rule], files: list[FileDiff], backend: str | None = None) -> list[Finding]:
     """Group rules by source file (one call per rule file) and judge each group."""
-    client = anthropic.Anthropic()
+    resolved = resolve_backend(backend)
+    if resolved is None:
+        logger.warning("No judge backend available (no ANTHROPIC_API_KEY, no `claude` CLI).")
+        return []
+
+    client = anthropic.Anthropic() if resolved == "api" else None
     groups: dict[str, list[Rule]] = {}
     for rule in rules:
         groups.setdefault(rule.source_file, []).append(rule)
 
     findings: list[Finding] = []
     for source, group in groups.items():
-        logger.info("Judging %d rules from %s", len(group), source)
-        findings.extend(judge_rule_group(client, group, files))
+        logger.info("Judging %d rules from %s (backend=%s)", len(group), source, resolved)
+        findings.extend(judge_rule_group(group, files, resolved, client))
     return findings
