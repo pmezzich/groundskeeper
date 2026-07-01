@@ -46,6 +46,8 @@ def select_prs_to_review(
     """
     selected: list[PRRef] = []
     for pr in open_prs:
+        if len(selected) >= limit:
+            break
         if pr.draft and not include_drafts:
             continue
         if pr.author in skip_authors:
@@ -53,8 +55,6 @@ def select_prs_to_review(
         if state.get(str(pr.number)) == pr.head_sha:
             continue
         selected.append(pr)
-        if len(selected) >= limit:
-            break
     return selected
 
 

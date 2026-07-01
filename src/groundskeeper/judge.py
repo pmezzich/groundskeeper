@@ -141,12 +141,15 @@ def _judge_via_cli(system_text: str, user_text: str) -> JudgeResponse | None:
     claude = shutil.which("claude") or "claude"
     prompt = f"{system_text}{_JSON_TAIL}\n\n{user_text}"
     try:
+        # Prompt goes on STDIN, not argv: the rules+hunks prompt routinely
+        # exceeds the OS command-line length limit (~32 KB on Windows), which
+        # would truncate or fail an argv-passed prompt.
         proc = subprocess.run(
-            [claude, "-p", prompt, "--output-format", "json", "--model", MODEL],
+            [claude, "-p", "--output-format", "json", "--model", MODEL],
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=300,
-            stdin=subprocess.DEVNULL,  # headless: don't block 3s waiting on stdin
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("claude CLI judge call failed: %s", exc)

@@ -52,3 +52,8 @@ def test_limit_counts_only_eligible():
     # first PR is a draft (skipped); limit=2 should still yield two REAL PRs
     prs = [_pr(1, draft=True), _pr(2), _pr(3), _pr(4)]
     assert [p.number for p in select_prs_to_review(prs, {}, limit=2)] == [2, 3]
+
+
+def test_limit_zero_selects_nothing():
+    prs = [_pr(1), _pr(2)]
+    assert select_prs_to_review(prs, {}, limit=0) == []
