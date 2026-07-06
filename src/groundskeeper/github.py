@@ -244,6 +244,8 @@ def fetch_rules_from_base(repo: str, base_ref: str, token: str, rules_path: str)
             headers=_headers(token),
             params={"ref": base_ref},
         )
+        if listing.status_code == 404:
+            return {}  # repo has no rules dir here — caller falls back to bundled/local rules
         if listing.status_code != 200:
             raise GitHubError(f"Failed to list {rules_path} at {base_ref}: HTTP {listing.status_code}")
         for entry in listing.json():

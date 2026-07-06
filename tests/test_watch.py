@@ -7,7 +7,7 @@ pass, so its skip/dedup/limit rules are pinned here without touching the API.
 from __future__ import annotations
 
 from groundskeeper.models import PRRef
-from groundskeeper.watch import select_prs_to_review
+from groundskeeper.watch import load_repos_config, select_prs_to_review
 
 
 def _pr(number: int, sha: str = "abc", *, draft: bool = False, author: str = "alice") -> PRRef:
@@ -57,3 +57,17 @@ def test_limit_counts_only_eligible():
 def test_limit_zero_selects_nothing():
     prs = [_pr(1), _pr(2)]
     assert select_prs_to_review(prs, {}, limit=0) == []
+
+
+def test_load_repos_config_mixed_entries(tmp_path):
+    cfg = tmp_path / "repos.json"
+    cfg.write_text(
+        '{"repos": ["prebid/a", {"repo": "prebid/b", "rules_dir": "mobile/rules"}, {"nope": 1}]}',
+        encoding="utf-8",
+    )
+    specs = load_repos_config(cfg)
+    # bare string → no rules_dir; object → repo+rules_dir; malformed entry skipped
+    assert [(s.repo, s.rules_dir) for s in specs] == [
+        ("prebid/a", None),
+        ("prebid/b", "mobile/rules"),
+    ]

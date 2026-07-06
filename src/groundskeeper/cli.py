@@ -203,10 +203,48 @@ def cmd_watch(args: argparse.Namespace) -> None:
         include_drafts=args.include_drafts,
         skip_authors=frozenset(args.skip_author or ()),
         limit=args.limit,
+        rules_dirs=args.rules_dir,
     )
     tail = f", posted {result.posted}" if args.post else ""
     console.print(f"  reviewed {len(result.reviewed)} PR(s), skipped {result.skipped}{tail}")
     console.print(f"  reports written to [bold]{result.out_dir}[/bold] (see SUMMARY.md)")
+    if not args.post:
+        console.print("[dim]dry-run: nothing posted. Re-run with --post to go live.[/dim]")
+
+
+def cmd_watch_all(args: argparse.Namespace) -> None:
+    from groundskeeper.judge import resolve_backend
+    from groundskeeper.watch import load_repos_config, run_watch_all
+
+    token = github.resolve_token()
+    backend = resolve_backend(getattr(args, "judge", None))
+    if backend is None:
+        console.print("[red]No judge backend — set ANTHROPIC_API_KEY or install the `claude` CLI.[/red]")
+        sys.exit(1)
+
+    specs = load_repos_config(Path(args.config))
+    if not specs:
+        console.print(f"[red]No repos found in config {args.config}[/red]")
+        sys.exit(1)
+
+    mode = "POST (live comments)" if args.post else "dry-run (local reports)"
+    console.print(f"[bold]Watching {len(specs)} repos[/bold] — backend: {backend}, mode: {mode}")
+    results = run_watch_all(
+        specs,
+        token,
+        backend=backend,
+        post=args.post,
+        out_root=Path(args.out_dir),
+        include_drafts=args.include_drafts,
+        skip_authors=frozenset(args.skip_author or ()),
+        limit=args.limit,
+    )
+    for repo, result in results:
+        if result is None:
+            console.print(f"  [red]{repo}: failed (see log)[/red]")
+        else:
+            console.print(f"  {repo}: reviewed {len(result.reviewed)}, skipped {result.skipped}")
+    console.print(f"  index written to [bold]{Path(args.out_dir) / 'INDEX.md'}[/bold]")
     if not args.post:
         console.print("[dim]dry-run: nothing posted. Re-run with --post to go live.[/dim]")
 
@@ -286,6 +324,35 @@ def main() -> None:
         action="append",
         help="Skip PRs by this author, e.g. a bot (repeatable)",
     )
+    watch_p.add_argument(
+        "--rules-dir",
+        action="append",
+        help="Local rules dir for this repo (repeatable) — e.g. the mined mobile corpus",
+    )
+
+    watchall = sub.add_parser("watch-all", help="Watch every repo in a config file (one INDEX.md across all)")
+    watchall.add_argument(
+        "--config",
+        required=True,
+        help='JSON: {"repos": ["org/repo", {"repo": "org/r", "rules_dir": "mobile/rules"}]}',
+    )
+    watchall.add_argument(
+        "--judge",
+        choices=["auto", "api", "claude-cli"],
+        default="auto",
+        help="Judge backend: 'api' or 'claude-cli' (a Claude subscription). Default: auto.",
+    )
+    watchall.add_argument(
+        "--post", action="store_true", help="Post comments (default: dry-run, local reports only)"
+    )
+    watchall.add_argument(
+        "--out-dir",
+        default="groundskeeper-reports",
+        help="Root dir; one subfolder per repo + an aggregate INDEX.md",
+    )
+    watchall.add_argument("--limit", type=int, default=10, help="Max PRs per repo per run")
+    watchall.add_argument("--include-drafts", action="store_true", help="Also review draft PRs")
+    watchall.add_argument("--skip-author", action="append", help="Skip PRs by this author (repeatable)")
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -301,6 +368,8 @@ def main() -> None:
         cmd_benchmark(args)
     elif args.command == "watch":
         cmd_watch(args)
+    elif args.command == "watch-all":
+        cmd_watch_all(args)
     else:
         parser.print_help()
         sys.exit(1)

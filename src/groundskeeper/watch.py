@@ -76,28 +76,46 @@ def _save_state(path: Path, state: dict[str, str]) -> None:
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _compile_rules(repo: str, base_ref: str, token: str) -> list[Rule]:
-    """Rules from the PR's BASE ref (a PR can't edit rules to pass itself),
-    plus groundskeeper's bundled supplementary rules."""
+def _compile_rules(repo: str, base_ref: str, token: str, rules_dirs: list[str] | None = None) -> list[Rule]:
+    """Compile the rules to judge this repo against, from three sources
+    (deduped by id, first-seen wins):
+      1. explicit local rules dirs (e.g. the mined mobile corpus for a repo with
+         no `.claude/rules` of its own),
+      2. the repo's own `.claude/rules` at the PR's BASE ref (a PR can't edit
+         rules to pass itself) — absent for most non-salesagent repos, which is
+         fine: that fetch returns nothing rather than erroring,
+      3. groundskeeper's bundled supplementary rules.
+    """
     rules: list[Rule] = []
+    seen: set[str] = set()
+
+    def _add(candidates: list[Rule]) -> None:
+        for rule in candidates:
+            if rule.id not in seen:
+                seen.add(rule.id)
+                rules.append(rule)
+
+    for rules_dir in rules_dirs or []:
+        _add(compile_rules_dir(Path(rules_dir)))
+
     contents = github.fetch_rules_from_base(repo, base_ref, token, DEFAULT_RULES_PATH)
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in contents.items():
             p = Path(tmp) / name
             p.write_text(text, encoding="utf-8")
-            rules.extend(compile_rules_file(p, source_label=name))
+            _add(compile_rules_file(p, source_label=name))
+
     if BUNDLED_RULES_DIR.is_dir():
-        seen = {r.id for r in rules}
-        for rule in compile_rules_dir(BUNDLED_RULES_DIR):
-            if rule.id not in seen:
-                rules.append(rule)
+        _add(compile_rules_dir(BUNDLED_RULES_DIR))
     return rules
 
 
-def review_one(repo: str, number: int, token: str, backend: str) -> list[Finding]:
+def review_one(
+    repo: str, number: int, token: str, backend: str, rules_dirs: list[str] | None = None
+) -> list[Finding]:
     """Full pipeline for one PR: deterministic checks + semantic judge."""
     pr = github.fetch_pull_request(repo, number, token)
-    rules = _compile_rules(repo, pr.base_ref, token)
+    rules = _compile_rules(repo, pr.base_ref, token, rules_dirs)
     findings = run_deterministic_checks(pr.files)
     findings.extend(judge_all(rules, pr.files, backend=backend))
     return findings
@@ -151,6 +169,7 @@ def run_watch(
     include_drafts: bool = False,
     skip_authors: frozenset[str] = frozenset(),
     limit: int = 10,
+    rules_dirs: list[str] | None = None,
 ) -> WatchResult:
     """Review the repo's open PRs. Dry-run writes reports; post also comments."""
     state = _load_state(state_file)
@@ -168,7 +187,7 @@ def run_watch(
 
     for pr_ref in to_review:
         logger.info("reviewing %s#%d @ %s", repo, pr_ref.number, pr_ref.head_sha[:10])
-        findings = review_one(repo, pr_ref.number, token, backend)
+        findings = review_one(repo, pr_ref.number, token, backend, rules_dirs)
         body = render_markdown_report(repo, pr_ref.number, findings)
         (out_dir / f"pr-{pr_ref.number}.md").write_text(body, encoding="utf-8")
         if post:
@@ -181,3 +200,93 @@ def run_watch(
     _save_state(state_file, state)
     _write_summary(out_dir, repo, result, post)
     return result
+
+
+@dataclass
+class RepoSpec:
+    """One repo to watch, with an optional local rules dir (e.g. a mined corpus
+    for a repo that has no `.claude/rules` of its own)."""
+
+    repo: str
+    rules_dir: str | None = None
+
+
+def load_repos_config(path: Path) -> list[RepoSpec]:
+    """Parse a repos config file. Entries may be a bare "org/repo" string or an
+    object {"repo": "org/repo", "rules_dir": "path"}. Malformed entries (no repo)
+    are skipped rather than aborting the run."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    specs: list[RepoSpec] = []
+    for entry in data.get("repos", []):
+        if isinstance(entry, str):
+            specs.append(RepoSpec(repo=entry))
+        elif isinstance(entry, dict) and entry.get("repo"):
+            specs.append(RepoSpec(repo=str(entry["repo"]), rules_dir=entry.get("rules_dir")))
+    return specs
+
+
+def _repo_slug(repo: str) -> str:
+    return repo.replace("/", "__")
+
+
+def _write_index(out_root: Path, results: list[tuple[str, WatchResult | None]], post: bool) -> None:
+    mode = "POSTED as PR comments" if post else "DRY-RUN — local only, nothing posted"
+    lines = [
+        "# Groundskeeper watch — all repos",
+        "",
+        f"Mode: **{mode}**.",
+        "",
+        "| Repo | Reviewed | Violations | Uncertain | Report |",
+        "|---|---|---|---|---|",
+    ]
+    for repo, result in results:
+        if result is None:
+            lines.append(f"| {repo} | — | — | — | _(failed — see log)_ |")
+            continue
+        v = sum(_counts(f)[0] for _, f in result.reviewed)
+        u = sum(_counts(f)[1] for _, f in result.reviewed)
+        slug = _repo_slug(repo)
+        lines.append(
+            f"| {repo} | {len(result.reviewed)} | {v} | {u} | [`{slug}/SUMMARY.md`]({slug}/SUMMARY.md) |"
+        )
+    (out_root / "INDEX.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_watch_all(
+    specs: list[RepoSpec],
+    token: str,
+    *,
+    backend: str,
+    post: bool,
+    out_root: Path,
+    include_drafts: bool = False,
+    skip_authors: frozenset[str] = frozenset(),
+    limit: int = 10,
+) -> list[tuple[str, WatchResult | None]]:
+    """Watch each repo in turn (own subfolder + state), then write an aggregate
+    INDEX.md. One repo failing (transient API error, etc.) must not abort the
+    rest, so per-repo exceptions are caught and recorded as a null result."""
+    out_root.mkdir(parents=True, exist_ok=True)
+    results: list[tuple[str, WatchResult | None]] = []
+    for spec in specs:
+        sub = out_root / _repo_slug(spec.repo)
+        rules_dirs = [spec.rules_dir] if spec.rules_dir else None
+        try:
+            result: WatchResult | None = run_watch(
+                spec.repo,
+                token,
+                backend=backend,
+                post=post,
+                out_dir=sub,
+                state_file=sub / "state.json",
+                include_drafts=include_drafts,
+                skip_authors=skip_authors,
+                limit=limit,
+                rules_dirs=rules_dirs,
+            )
+        except Exception as exc:  # noqa: BLE001 — batch resilience: skip a bad repo, keep going
+            logger.warning("watch failed for %s: %s", spec.repo, exc)
+            result = None
+        results.append((spec.repo, result))
+    _write_index(out_root, results, post)
+    return results
