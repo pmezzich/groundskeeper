@@ -76,7 +76,9 @@ def _save_state(path: Path, state: dict[str, str]) -> None:
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _compile_rules(repo: str, base_ref: str, token: str, rules_dirs: list[str] | None = None) -> list[Rule]:
+def _compile_rules(
+    repo: str, base_ref: str, token: str, rules_dirs: list[str] | None = None
+) -> tuple[list[Rule], str]:
     """Compile the rules to judge this repo against, from three sources
     (deduped by id, first-seen wins):
       1. explicit local rules dirs (e.g. the mined mobile corpus for a repo with
@@ -85,40 +87,60 @@ def _compile_rules(repo: str, base_ref: str, token: str, rules_dirs: list[str] |
          rules to pass itself) — absent for most non-salesagent repos, which is
          fine: that fetch returns nothing rather than erroring,
       3. groundskeeper's bundled supplementary rules.
+
+    Returns (rules, note) where the note honestly states each source's share —
+    a repo with no rules of its own must not be reported as if it had them.
     """
     rules: list[Rule] = []
     seen: set[str] = set()
 
-    def _add(candidates: list[Rule]) -> None:
+    def _add(candidates: list[Rule]) -> int:
+        n = 0
         for rule in candidates:
             if rule.id not in seen:
                 seen.add(rule.id)
                 rules.append(rule)
+                n += 1
+        return n
 
+    local_n = 0
     for rules_dir in rules_dirs or []:
-        _add(compile_rules_dir(Path(rules_dir)))
+        local_n += _add(compile_rules_dir(Path(rules_dir)))
 
     contents = github.fetch_rules_from_base(repo, base_ref, token, DEFAULT_RULES_PATH)
+    repo_n = 0
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in contents.items():
             p = Path(tmp) / name
             p.write_text(text, encoding="utf-8")
-            _add(compile_rules_file(p, source_label=name))
+            repo_n += _add(compile_rules_file(p, source_label=name))
 
+    bundled_n = 0
     if BUNDLED_RULES_DIR.is_dir():
-        _add(compile_rules_dir(BUNDLED_RULES_DIR))
-    return rules
+        bundled_n = _add(compile_rules_dir(BUNDLED_RULES_DIR))
+
+    parts = []
+    if repo_n:
+        parts.append(f"{repo_n} from this repo's `.claude/rules` (base ref)")
+    if local_n:
+        parts.append(f"{local_n} from a corpus mined from this repo's review history")
+    if bundled_n:
+        parts.append(f"{bundled_n} bundled")
+    note = f"Rules: {', '.join(parts)}." if parts else "No rules compiled — deterministic checks only."
+    return rules, note
 
 
 def review_one(
     repo: str, number: int, token: str, backend: str, rules_dirs: list[str] | None = None
-) -> list[Finding]:
-    """Full pipeline for one PR: deterministic checks + semantic judge."""
+) -> tuple[list[Finding], str]:
+    """Full pipeline for one PR: deterministic checks + semantic judge.
+
+    Returns (findings, rules_note) so reports can state rule provenance."""
     pr = github.fetch_pull_request(repo, number, token)
-    rules = _compile_rules(repo, pr.base_ref, token, rules_dirs)
+    rules, note = _compile_rules(repo, pr.base_ref, token, rules_dirs)
     findings = run_deterministic_checks(pr.files)
     findings.extend(judge_all(rules, pr.files, backend=backend))
-    return findings
+    return findings, note
 
 
 @dataclass
@@ -187,8 +209,8 @@ def run_watch(
 
     for pr_ref in to_review:
         logger.info("reviewing %s#%d @ %s", repo, pr_ref.number, pr_ref.head_sha[:10])
-        findings = review_one(repo, pr_ref.number, token, backend, rules_dirs)
-        body = render_markdown_report(repo, pr_ref.number, findings)
+        findings, rules_note = review_one(repo, pr_ref.number, token, backend, rules_dirs)
+        body = render_markdown_report(repo, pr_ref.number, findings, rules_note)
         (out_dir / f"pr-{pr_ref.number}.md").write_text(body, encoding="utf-8")
         if post:
             url = github.post_pr_comment(repo, pr_ref.number, token, body)

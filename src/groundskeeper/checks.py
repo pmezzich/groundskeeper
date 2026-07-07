@@ -21,8 +21,22 @@ import re
 
 from groundskeeper.models import FileDiff, Finding, Severity, VerdictStatus
 
-_CI_FILE_RE = re.compile(r"(\.github/workflows/|Makefile|tox\.ini|run_all_tests|\.pre-commit)")
-_TEST_INVOCATION_RE = re.compile(r"pytest|tox\b|make\s+\S*test|run_all_tests|coverage|mypy|ruff")
+_CI_FILE_RE = re.compile(
+    r"(\.github/workflows/|Makefile|tox\.ini|run_all_tests|\.pre-commit"
+    r"|(^|/)package\.json$|Jenkinsfile|\.gitlab-ci|\.circleci/|azure-pipelines|\.travis)"
+)
+# Word-bound tool names: "mochawesome-report" must not read as mocha, nor
+# ".eslintcache" as eslint.
+_TEST_INVOCATION_RE = re.compile(
+    r"pytest|tox\b|make\s+\S*test|run_all_tests|coverage|mypy|ruff"
+    r"|\bjest\b|\bmocha\b|\bvitest\b|\bkarma\b|gulp\s+test|npm\s+(?:run\s+)?test|yarn\s+test"
+    r"|go\s+test|gradle\w*\s+\S*(?:test|check)|xcodebuild\s+\S*test|\beslint\b|\btsc\b"
+)
+# Cleanup/teardown verbs: `rm -rf mochawesome-report || true` is idempotent
+# noise, not CI weakening, even though it names a test tool's artifacts.
+_CLEANUP_RE = re.compile(r"\b(rm|rimraf|pkill|killall|del|prune|clean)\b")
+# Python-comment shape ONLY — the Python checks' justification semantics are
+# benchmarked and frozen; //-style languages use _C_COMMENT_RE further down.
 _COMMENT_RE = re.compile(r"^\s*#\s*\S+")
 
 
@@ -172,8 +186,277 @@ def check_test_skip_added(files: list[FileDiff]) -> list[Finding]:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Multi-language layer (JS/TS, Go, Java, Kotlin, Swift).
+#
+# ISOLATION INVARIANT: nothing below may alter the behavior of the Python
+# checks above — those are benchmarked against salesagent review history and
+# must stay byte-identical. Every pattern here is extension-gated and uses its
+# own comment/justification semantics. (An earlier draft mixed the two and an
+# adversarial review demonstrated three Python verdict flips — keep them apart.)
+#
+# Noise policy (calibrated for posting on strangers' PRs):
+# - Blanket suppressions (@ts-ignore, bare eslint-disable, bare //nolint,
+#   bare swiftlint:disable) -> VIOLATION.
+# - Scoped suppressions (named rules/codes) -> UNCERTAIN note, never blocking:
+#   they are idiomatic in these ecosystems.
+# - Conventional Java/Kotlin boilerplate (unchecked/deprecation/...) -> silent.
+# - Vendored/generated/minified files -> skipped entirely.
+
+_JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue")
+_GENERATED_PATH_RE = re.compile(
+    r"\.min\.(js|css)$|(^|/)(dist|build|vendor|vendored|node_modules|generated)/"
+    r"|package-lock\.json$|creative-renderer"
+)
+
+_C_COMMENT_RE = re.compile(r"^\s*(//|/\*)\s*\S")
+
+
+def _has_c_comment_above(file: FileDiff, content: str) -> bool:
+    """A //-style comment line within 6 patch lines above the added line."""
+    patch_lines = file.patch.splitlines()
+    target = "+" + content
+    for i, line in enumerate(patch_lines):
+        if line == target:
+            for prev in patch_lines[max(0, i - 6) : i]:
+                code = prev[1:] if prev[:1] in "+- " else prev
+                if _C_COMMENT_RE.match(code):
+                    return True
+    return False
+
+
+# Each spec: (extensions, directive, scoped-variant-or-None, label,
+# needs_comment_context). "Scoped" = the directive names what it suppresses.
+# needs_comment_context: the directive text must appear after a comment marker
+# on its line, so prose/string MENTIONS of a directive don't fire.
+_SUPPRESSION_SPECS: list[tuple[tuple[str, ...], re.Pattern[str], re.Pattern[str] | None, str, bool]] = [
+    (_JS_EXTS, re.compile(r"@ts-ignore\b"), None, "`@ts-ignore`", True),
+    # @ts-expect-error self-verifies (errors when unnecessary) -> inherently scoped
+    (
+        _JS_EXTS,
+        re.compile(r"@ts-expect-error\b"),
+        re.compile(r"@ts-expect-error\b"),
+        "`@ts-expect-error`",
+        True,
+    ),
+    (
+        _JS_EXTS,
+        re.compile(r"eslint-disable(?:-next-line|-line)?"),
+        re.compile(r"eslint-disable(?:-next-line|-line)?\s+[\w@/-]"),  # names specific rules
+        "`eslint-disable`",
+        True,
+    ),
+    ((".go",), re.compile(r"//\s*nolint\b"), re.compile(r"//\s*nolint:\w"), "`//nolint`", False),
+    # Annotations take mandatory args naming the warning -> inherently scoped.
+    (
+        (".java",),
+        re.compile(r"@SuppressWarnings\s*\("),
+        re.compile(r"@SuppressWarnings\s*\("),
+        "`@SuppressWarnings`",
+        False,
+    ),
+    (
+        (".kt", ".kts"),
+        re.compile(r"@(?:file:)?Suppress\s*\("),
+        re.compile(r"@(?:file:)?Suppress\s*\("),
+        "`@Suppress`",
+        False,
+    ),
+    (
+        (".swift",),
+        re.compile(r"//\s*swiftlint:disable\b"),
+        re.compile(r"swiftlint:disable(?::\w+)?\s+\w"),  # names specific rules
+        "`swiftlint:disable`",
+        False,
+    ),
+]
+
+# Reviewer-accepted Java/Kotlin boilerplate — flagging these floods adapter PRs.
+_CONVENTIONAL_SUPPRESS_RE = re.compile(
+    r'@(?:file:)?Suppress(?:Warnings)?\s*\(\s*[{\[]?\s*"'
+    r"(unchecked|deprecation|rawtypes|serial|DEPRECATION|UNCHECKED_CAST)\""
+)
+
+
+def _in_js_comment_context(content: str, idx: int) -> bool:
+    head = content[:idx]
+    return "//" in head or "/*" in head or "<!--" in head
+
+
+def check_lint_suppression_added(files: list[FileDiff]) -> list[Finding]:
+    """Blanket lint/type suppressions in the non-Python prebid languages."""
+    findings = []
+    for f in files:
+        if _GENERATED_PATH_RE.search(f.path):
+            continue
+        specs = [s for s in _SUPPRESSION_SPECS if f.path.endswith(s[0])]
+        if not specs:
+            continue
+        for line in f.added_lines:
+            # When several directives share a line ("// eslint-disable-next-line
+            # no-undef -- replaces old @ts-ignore"), judge the LEFTMOST one —
+            # it's the actual directive; later mentions are prose.
+            matches = [(m.start(), spec, m) for spec in specs for m in [spec[1].search(line.content)] if m]
+            if not matches:
+                continue
+            start, spec, m = min(matches, key=lambda t: t[0])
+            _, _, scoped_re, label, needs_ctx = spec
+            if needs_ctx and not _in_js_comment_context(line.content, start):
+                continue  # prose/string mention, not a directive
+            if label in ("`@SuppressWarnings`", "`@Suppress`") and not line.content.lstrip().startswith("@"):
+                continue  # mentioned mid-line (comment/string), not an annotation
+            if _CONVENTIONAL_SUPPRESS_RE.search(line.content):
+                continue  # unchecked/deprecation boilerplate — reviewer-accepted
+            if _moved_or_reflowed(f, line.content):
+                continue
+            scoped = scoped_re is not None and scoped_re.search(line.content) is not None
+            if not scoped:
+                findings.append(
+                    _finding(
+                        "det/lint-suppression-added",
+                        f"Blanket {label} suppression",
+                        f,
+                        line.line_number,
+                        f"A blanket {label} (no rule named) hides every future error at this "
+                        "site, not just the current one.",
+                        "Scope the suppression to the specific rule, or fix the underlying issue.",
+                    )
+                )
+            else:
+                tail = line.content[m.end() :]
+                # eslint's official description syntax is `... rule -- why`;
+                # anchored after the directive so `i--` etc. can't fake it.
+                documented = _has_c_comment_above(f, line.content) or bool(re.search(r"\s--\s+\S", tail))
+                explanation = (
+                    f"New scoped, documented {label} — verify the justification holds."
+                    if documented
+                    else f"New scoped {label} with no adjacent justification — idiomatic, but worth a glance."
+                )
+                findings.append(
+                    _finding(
+                        "det/lint-suppression-added",
+                        f"New scoped {label} suppression",
+                        f,
+                        line.line_number,
+                        explanation,
+                        severity=Severity.NOTE,
+                        status=VerdictStatus.UNCERTAIN,
+                    )
+                )
+    return findings
+
+
+def _is_multilang_test_file(path: str) -> bool:
+    if path.endswith(".go"):
+        return path.endswith("_test.go")
+    p = path.lower()
+    if path.endswith(_JS_EXTS):
+        return "test" in p or ".spec." in p or "__tests__" in p
+    return "test" in p  # .java/.kt/.kts/.swift conventions
+
+
+# Each spec: (extensions, pattern, reason_arg, conditional_gate).
+# reason_arg: a quoted arg IMMEDIATELY after the match is a skip reason
+# (t.Skip("flaky")) — for JS it.skip("name", fn) the arg is just the test name.
+# conditional_gate: XCTSkipIf/XCTSkipUnless-style capability gates are a
+# legitimate idiom -> always UNCERTAIN note, never a violation.
+# NOTE: Jasmine's `fit(`/`fdescribe(` are deliberately NOT matched — `fit(` is
+# a common real function name (model.fit, image.fit) and none of the prebid
+# JS repos use Jasmine.
+_SKIP_SPECS: list[tuple[tuple[str, ...], re.Pattern[str], bool, bool]] = [
+    (_JS_EXTS, re.compile(r"\b(it|test|describe|context)\.skip\b"), False, False),
+    (_JS_EXTS, re.compile(r"\bx(it|describe|test)\s*\("), False, False),
+    ((".go",), re.compile(r"\bt\.Skipf?\b"), True, False),
+    ((".java", ".kt", ".kts"), re.compile(r"@(Ignore|Disabled)\b"), True, False),
+    ((".swift",), re.compile(r"\bXCTSkip\b"), True, False),
+    ((".swift",), re.compile(r"\bXCTSkip(If|Unless)\b"), False, True),
+]
+_JS_ONLY_RE = re.compile(r"\b(it|test|describe|context)\.only\s*\(")
+
+
+def check_test_skip_multilang(files: list[FileDiff]) -> list[Finding]:
+    """Test skips and exclusive focus in the non-Python prebid languages."""
+    findings = []
+    for f in files:
+        if _GENERATED_PATH_RE.search(f.path) or not _is_multilang_test_file(f.path):
+            continue
+        specs = [s for s in _SKIP_SPECS if f.path.endswith(s[0])]
+        is_js = f.path.endswith(_JS_EXTS)
+        if not specs and not is_js:
+            continue
+        for line in f.added_lines:
+            # Exclusive focus silently deselects the REST of the suite — worse
+            # than a skip, and never legitimate in a merged PR.
+            if is_js and _JS_ONLY_RE.search(line.content):
+                if _moved_or_reflowed(f, line.content):
+                    continue
+                findings.append(
+                    _finding(
+                        "det/test-skip-added",
+                        "Exclusive test focus (.only) added",
+                        f,
+                        line.line_number,
+                        "`.only` runs just this test and silently deselects the rest of the "
+                        "suite — a debugging artifact that must not merge.",
+                        "Remove the exclusive-focus marker.",
+                    )
+                )
+                continue
+            hit = next(
+                ((spec, m) for spec in specs for m in [spec[1].search(line.content)] if m),
+                None,
+            )
+            if hit is None:
+                continue
+            (_, _, reason_arg, conditional), m = hit
+            # Annotations must BE annotations, not prose mentions ("// TODO:
+            # revisit the @Disabled cases").
+            if m.group(0).startswith("@") and not line.content.lstrip().startswith("@"):
+                continue
+            if _moved_or_reflowed(f, line.content):
+                continue
+            tail = line.content[m.end() :]
+            documented = (
+                conditional
+                or (reason_arg and re.match(r"\s*\(\s*[\"']", tail) is not None)
+                or _has_c_comment_above(f, line.content)
+            )
+            if documented:
+                explanation = (
+                    "Conditional capability gate — verify the condition genuinely can't be met "
+                    "in CI, not that a failing case is being dodged."
+                    if conditional
+                    else "New skip with a stated reason — verify it's a sanctioned stub, not a "
+                    "bypassed failure."
+                )
+                findings.append(
+                    _finding(
+                        "det/test-skip-added",
+                        "New test skip (has reason)",
+                        f,
+                        line.line_number,
+                        explanation,
+                        severity=Severity.NOTE,
+                        status=VerdictStatus.UNCERTAIN,
+                    )
+                )
+            else:
+                findings.append(
+                    _finding(
+                        "det/test-skip-added",
+                        "New test skip marker",
+                        f,
+                        line.line_number,
+                        "Test-integrity policy: never add a skip to bypass failures "
+                        "(stubs for unimplemented work are the only exception).",
+                        "Fix the failing test or code; if blocked, report it instead of skipping.",
+                    )
+                )
+    return findings
+
+
 def check_ci_weakening(files: list[FileDiff]) -> list[Finding]:
-    deselect_re = re.compile(r'-k\s+["\']not\s|--deselect')
+    deselect_re = re.compile(r'-k\s+["\']not\s|--deselect|--testPathIgnorePatterns')
     suppress_re = re.compile(r"\|\|\s*true")
     findings = []
     for f in files:
@@ -184,8 +467,13 @@ def check_ci_weakening(files: list[FileDiff]) -> list[Finding]:
                 continue
             is_deselect = deselect_re.search(line.content)
             # `|| true` is only weakening when it suppresses a test/quality
-            # command — cleanup/teardown (docker prune etc.) is idempotent noise.
-            is_suppress = suppress_re.search(line.content) and _TEST_INVOCATION_RE.search(line.content)
+            # command — cleanup/teardown (docker prune, rm -rf artifacts) is
+            # idempotent noise even when it names a test tool's output dirs.
+            is_suppress = (
+                suppress_re.search(line.content)
+                and _TEST_INVOCATION_RE.search(line.content)
+                and not _CLEANUP_RE.search(line.content)
+            )
             if is_deselect or is_suppress:
                 findings.append(
                     _finding(
@@ -396,7 +684,9 @@ def check_workflow_job_hygiene(files: list[FileDiff]) -> list[Finding]:
 
 ALL_CHECKS = [
     check_type_ignore_added,
+    check_lint_suppression_added,
     check_test_skip_added,
+    check_test_skip_multilang,
     check_ci_weakening,
     check_fixme_deleted,
     check_guard_file_touched,

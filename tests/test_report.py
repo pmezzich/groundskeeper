@@ -54,6 +54,20 @@ def test_suggested_fix_section_rendered():
     assert "do the thing" in md
 
 
+def test_rules_note_rendered_when_provided():
+    md = render_markdown_report(
+        "o/r", 1, [_finding(VerdictStatus.VIOLATION)], rules_note="Rules: 43 bundled."
+    )
+    assert "Rules: 43 bundled." in md
+    # the old blanket claim must not appear for repos without their own rules
+    assert "this repo's own `.claude/rules`" not in md
+
+
+def test_default_note_is_honest_neutral():
+    md = render_markdown_report("o/r", 1, [_finding(VerdictStatus.VIOLATION)])
+    assert "Checked against rules compiled at the PR's base ref." in md
+
+
 def test_sort_orders_violation_uncertain_pass():
     findings = [
         _finding(VerdictStatus.PASS),

@@ -35,16 +35,20 @@ DEFAULT_RULES_PATH = ".claude/rules/patterns"
 BUNDLED_RULES_DIR = Path(__file__).resolve().parent.parent.parent / "rules"
 
 
-def _load_rules(args: argparse.Namespace, token: str, base_ref: str, repo: str) -> list[Rule]:
+def _load_rules(args: argparse.Namespace, token: str, base_ref: str, repo: str) -> tuple[list[Rule], str]:
     """Local --rules-dir(s) win; otherwise fetch rule files from the PR's BASE
-    ref. Groundskeeper's bundled supplementary rules are always appended."""
+    ref. Groundskeeper's bundled supplementary rules are always appended.
+
+    Returns (rules, provenance_note) — reports must say where rules came from."""
     rules: list[Rule] = []
+    parts: list[str] = []
     if args.rules_dir:
         for rules_dir in args.rules_dir:
             rules.extend(compile_rules_dir(Path(rules_dir)))
         if not rules:
             console.print(f"[red]No rules found under {args.rules_dir}[/red]")
             sys.exit(1)
+        parts.append(f"{len(rules)} from local rules dir(s)")
     else:
         contents = github.fetch_rules_from_base(repo, base_ref, token, DEFAULT_RULES_PATH)
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,16 +59,21 @@ def _load_rules(args: argparse.Namespace, token: str, base_ref: str, repo: str) 
         if not rules:
             console.print(f"[red]No rule files found at {repo}@{base_ref}:{DEFAULT_RULES_PATH}[/red]")
             sys.exit(1)
+        parts.append(f"{len(rules)} from this repo's `.claude/rules` (base ref)")
 
     if BUNDLED_RULES_DIR.is_dir():
         seen = {r.id for r in rules}
+        bundled_n = 0
         for rule in compile_rules_dir(BUNDLED_RULES_DIR):
             if rule.id not in seen:
                 rules.append(rule)
-    return rules
+                bundled_n += 1
+        if bundled_n:
+            parts.append(f"{bundled_n} bundled")
+    return rules, f"Rules: {', '.join(parts)}."
 
 
-def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding]]:
+def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding], str]:
     token = github.resolve_token()
     repo, number = github.parse_pr_ref(args.pr, args.repo)
 
@@ -82,7 +91,7 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding]]:
         pr = github.fetch_pull_request(repo, number, token)
     console.print(f"  {len(pr.files)} changed files, base={pr.base_ref}")
 
-    rules = _load_rules(args, token, pr.base_ref, repo)
+    rules, rules_note = _load_rules(args, token, pr.base_ref, repo)
     console.print(f"  {len(rules)} rules compiled")
 
     findings = run_deterministic_checks(pr.files)
@@ -103,20 +112,24 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding]]:
             console.print(f"  judging semantic rules… (backend: {backend})")
             findings.extend(judge_all(rules, pr.files, backend=backend))
 
-    return repo, number, findings
+    return repo, number, findings, rules_note
 
 
 def cmd_review(args: argparse.Namespace) -> None:
-    repo, number, findings = _run_review(args)
+    repo, number, findings, rules_note = _run_review(args)
     print_console_report(repo, number, findings)
 
     if args.output:
-        Path(args.output).write_text(render_markdown_report(repo, number, findings), encoding="utf-8")
+        Path(args.output).write_text(
+            render_markdown_report(repo, number, findings, rules_note), encoding="utf-8"
+        )
         console.print(f"[dim]Markdown report saved to {args.output}[/dim]")
 
     if args.post:
         token = github.resolve_token()
-        url = github.post_pr_comment(repo, number, token, render_markdown_report(repo, number, findings))
+        url = github.post_pr_comment(
+            repo, number, token, render_markdown_report(repo, number, findings, rules_note)
+        )
         console.print(f"[green]Posted:[/green] {url}")
 
 
@@ -145,7 +158,7 @@ def cmd_rules(args: argparse.Namespace) -> None:
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
-    repo, number, findings = _run_review(args)
+    repo, number, findings, _ = _run_review(args)
     print_console_report(repo, number, findings)
 
     token = github.resolve_token()
