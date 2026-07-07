@@ -153,6 +153,10 @@ def _judge_via_cli(system_text: str, user_text: str) -> JudgeResponse | None:
             encoding="utf-8",
             errors="replace",
             timeout=300,
+            # No console window on Windows: when run from a scheduled task, a
+            # flashing cmd window looks like malware — and a user closing it
+            # kills the whole run tree (observed in production).
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("claude CLI judge call failed: %s", exc)
