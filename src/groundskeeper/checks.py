@@ -682,6 +682,111 @@ def check_workflow_job_hygiene(files: list[FileDiff]) -> list[Finding]:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Factory-over-inline enforcement (salesagent Pattern #8).
+#
+# New test data must go through the model factory even when the surrounding
+# tests hand-roll `session.add(Model(...))`. The repository's own structural
+# guard exempts pre-allowlisted debt files, so raw construction keeps slipping
+# through there — this is the single most-repeated blocker in salesagent
+# reviews. This check deliberately consults NO allowlist: it fires on every
+# added `session.add(<Model>(...))` in a test file whenever `<Model>Factory`
+# is discoverable. Bypassing the allowlist is the entire point.
+
+# ORM models with a factory (the `Meta.model` of every factory exported from
+# salesagent's tests/factories package). A raw construction of one of these has
+# a factory to use instead. Curated so the check stays a pure function of the
+# diff — groundskeeper reviews over the API, without a repo checkout to grep.
+_FACTORY_BACKED_MODELS: frozenset[str] = frozenset(
+    {
+        "Account",
+        "AdapterConfig",
+        "AgentAccountAccess",
+        "AuthorizedProperty",
+        "CollectionListReference",
+        "Creative",
+        "CreativeAssignment",
+        "CreativeAsset",
+        "CurrencyLimit",
+        "DeliverySimulationConfig",
+        "Format",
+        "FormatId",
+        "FormatPerformanceMetrics",
+        "GAMInventory",
+        "InventoryProfile",
+        "MediaBuy",
+        "MediaPackage",
+        "PricingOption",
+        "Principal",
+        "Product",
+        "PropertyListReference",
+        "PropertyTag",
+        "PublisherPartner",
+        "PushNotificationConfig",
+        "Targeting",
+        "Tenant",
+        "TenantAuthConfig",
+        "User",
+    }
+)
+
+# `<session-like>.add(<Model>(` — the receiver is restricted to session names
+# so a plain `myset.add(Thing(...))` can't trip it, and the model must be a
+# CapWords name immediately constructed (not a bare variable or `.build()`).
+_SESSION_ADD_RE = re.compile(r"\b(session|db_session|db|sess)\.add\(\s*([A-Z][A-Za-z0-9_]*)\s*\(")
+_FACTORY_REF_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*Factory)\b")
+
+
+def _referenced_factories(files: list[FileDiff]) -> set[str]:
+    """Every `<Name>Factory` identifier mentioned anywhere in the PR — added
+    lines or surrounding patch context. A factory defined, imported, or used in
+    the same PR proves it exists even when it isn't in the curated set."""
+    names: set[str] = set()
+    for f in files:
+        for line in f.added_lines:
+            names.update(_FACTORY_REF_RE.findall(line.content))
+        if f.patch:
+            names.update(_FACTORY_REF_RE.findall(f.patch))
+    return names
+
+
+def check_raw_model_add(files: list[FileDiff]) -> list[Finding]:
+    """Raw `session.add(<Model>(...))` in a test file where `<Model>Factory`
+    exists. Salesagent Pattern #8: new test data uses the factory regardless of
+    what the surrounding tests do — so this fires even in files the repository-
+    pattern structural guard allowlists. It consults no allowlist by design."""
+    findings = []
+    referenced = _referenced_factories(files)
+    for f in files:
+        if "test" not in f.path or not f.path.endswith(".py"):
+            continue
+        for line in f.added_lines:
+            m = _SESSION_ADD_RE.search(line.content)
+            if not m:
+                continue
+            if _moved_or_reflowed(f, line.content):
+                continue  # moved/re-indented, not a newly hand-rolled construction
+            receiver, model = m.group(1), m.group(2)
+            factory = f"{model}Factory"
+            if model not in _FACTORY_BACKED_MODELS and factory not in referenced:
+                continue  # no discoverable factory — nothing to prefer
+            findings.append(
+                _finding(
+                    "det/raw-model-add",
+                    "Raw model construction where a factory exists",
+                    f,
+                    line.line_number,
+                    f"Raw `{receiver}.add({model}(...))` but `{factory}` exists — use the factory. "
+                    "Pattern #8 applies to new code even in files the repository-pattern guard "
+                    "allowlists.",
+                    f"Build the record with `{factory}(...)` instead of constructing `{model}` inline.",
+                    severity=Severity.BLOCKING,
+                    status=VerdictStatus.UNCERTAIN,
+                )
+            )
+    return findings
+
+
 ALL_CHECKS = [
     check_type_ignore_added,
     check_lint_suppression_added,
@@ -693,6 +798,7 @@ ALL_CHECKS = [
     check_rules_modified,
     check_ratchet_increased,
     check_workflow_job_hygiene,
+    check_raw_model_add,
 ]
 
 
