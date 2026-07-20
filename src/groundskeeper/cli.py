@@ -39,7 +39,7 @@ def _load_rules(args: argparse.Namespace, token: str, base_ref: str, repo: str) 
     """Local --rules-dir(s) win; otherwise fetch rule files from the PR's BASE
     ref. Groundskeeper's bundled supplementary rules are always appended.
 
-    Returns (rules, provenance_note) — reports must say where rules came from."""
+    Returns (rules, provenance_note) - reports must say where rules came from."""
     rules: list[Rule] = []
     parts: list[str] = []
     if args.rules_dir:
@@ -84,7 +84,7 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding], str]
         if at_commit:
             console.print(f"  first human review was at commit {at_commit[:10]}")
         else:
-            console.print("[yellow]  no human review found — using current head[/yellow]")
+            console.print("[yellow]  no human review found - using current head[/yellow]")
     if at_commit:
         pr = github.fetch_pull_request_at_commit(repo, number, at_commit, token)
     else:
@@ -105,7 +105,7 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding], str]
         backend = resolve_backend(getattr(args, "judge", None))
         if backend is None:
             console.print(
-                "[yellow]No judge backend — set ANTHROPIC_API_KEY or install the `claude` CLI. "
+                "[yellow]No judge backend - set ANTHROPIC_API_KEY or install the `claude` CLI. "
                 "Deterministic checks only.[/yellow]"
             )
         else:
@@ -165,7 +165,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     comments = github.fetch_human_review_comments(repo, number, token)
     console.print(f"\n[bold]Benchmarking against {len(comments)} human review comment(s)…[/bold]")
     if not comments:
-        console.print("[yellow]No human review comments on this PR — nothing to benchmark.[/yellow]")
+        console.print("[yellow]No human review comments on this PR - nothing to benchmark.[/yellow]")
         return
     if not os.environ.get("ANTHROPIC_API_KEY"):
         console.print("[red]Benchmark matching needs ANTHROPIC_API_KEY[/red]")
@@ -188,7 +188,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         table.add_row(
             m.reviewer_comment_summary,
             "[green]yes[/green]" if m.covered else "[red]no[/red]",
-            m.matching_rule_id or "—",
+            m.matching_rule_id or "-",
         )
     console.print(table)
     console.print(f"\n[bold]Recall: {recall:.0%}[/bold] of human review comments covered")
@@ -201,11 +201,11 @@ def cmd_watch(args: argparse.Namespace) -> None:
     token = github.resolve_token()
     backend = resolve_backend(getattr(args, "judge", None))
     if backend is None:
-        console.print("[red]No judge backend — set ANTHROPIC_API_KEY or install the `claude` CLI.[/red]")
+        console.print("[red]No judge backend - set ANTHROPIC_API_KEY or install the `claude` CLI.[/red]")
         sys.exit(1)
 
     mode = "POST (live comments)" if args.post else "dry-run (local reports)"
-    console.print(f"[bold]Watching {args.repo}[/bold] — backend: {backend}, mode: {mode}")
+    console.print(f"[bold]Watching {args.repo}[/bold] - backend: {backend}, mode: {mode}")
     result = run_watch(
         args.repo,
         token,
@@ -232,7 +232,7 @@ def cmd_watch_all(args: argparse.Namespace) -> None:
     token = github.resolve_token()
     backend = resolve_backend(getattr(args, "judge", None))
     if backend is None:
-        console.print("[red]No judge backend — set ANTHROPIC_API_KEY or install the `claude` CLI.[/red]")
+        console.print("[red]No judge backend - set ANTHROPIC_API_KEY or install the `claude` CLI.[/red]")
         sys.exit(1)
 
     specs = load_repos_config(Path(args.config))
@@ -241,7 +241,7 @@ def cmd_watch_all(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     mode = "POST (live comments)" if args.post else "dry-run (local reports)"
-    console.print(f"[bold]Watching {len(specs)} repos[/bold] — backend: {backend}, mode: {mode}")
+    console.print(f"[bold]Watching {len(specs)} repos[/bold] - backend: {backend}, mode: {mode}")
     results = run_watch_all(
         specs,
         token,
@@ -262,10 +262,54 @@ def cmd_watch_all(args: argparse.Namespace) -> None:
         console.print("[dim]dry-run: nothing posted. Re-run with --post to go live.[/dim]")
 
 
+def cmd_docs_drift(args: argparse.Namespace) -> None:
+    from rich.table import Table
+
+    from groundskeeper.docs_drift import DEFAULT_SOURCE_PREFIXES, compute_drift
+
+    prefixes = tuple(args.source) if args.source else DEFAULT_SOURCE_PREFIXES
+    report = compute_drift(
+        args.repo_path,
+        since_sha=args.since,
+        ref=args.ref,
+        converted_branch=args.converted_branch,
+        source_prefixes=prefixes,
+    )
+    console.print(
+        f"[bold]Docs drift[/bold] - converted source {list(prefixes)} "
+        f"@ {report.since_sha[:10]} vs {report.ref}"
+    )
+    table = Table(title="Drift vs the pinned conversion SHA")
+    table.add_column("Bucket", style="cyan")
+    table.add_column("Count", justify="right")
+    table.add_column("Meaning")
+    table.add_row("drifted", str(len(report.drifted)), "converted, then changed on master - re-run it")
+    table.add_row("new", str(len(report.new)), "never converted - needs a first conversion")
+    table.add_row("deleted", str(len(report.deleted)), "removed on master - converted copy orphaned")
+    console.print(table)
+
+    for bucket, paths in (("drifted", report.drifted), ("new", report.new), ("deleted", report.deleted)):
+        for p in paths[:12]:
+            console.print(f"  [dim]{bucket}[/dim] {p}")
+        if len(paths) > 12:
+            console.print(f"  [dim]… +{len(paths) - 12} more {bucket}[/dim]")
+
+    if args.output:
+        Path(args.output).write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        console.print(f"[dim]Report saved to {args.output}[/dim]")
+
+    verdict = (
+        f"[red]{report.total} page(s) out of sync[/red]" if report.has_drift else "[green]in sync[/green]"
+    )
+    console.print(f"\n{verdict} - {report.summary()}")
+    if report.has_drift:
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="groundskeeper",
-        description="Skills-enforcement PR review — compiles .claude/rules into verdicts",
+        description="Skills-enforcement PR review - compiles .claude/rules into verdicts",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command")
@@ -340,7 +384,7 @@ def main() -> None:
     watch_p.add_argument(
         "--rules-dir",
         action="append",
-        help="Local rules dir for this repo (repeatable) — e.g. the mined mobile corpus",
+        help="Local rules dir for this repo (repeatable) - e.g. the mined mobile corpus",
     )
 
     watchall = sub.add_parser("watch-all", help="Watch every repo in a config file (one INDEX.md across all)")
@@ -367,6 +411,25 @@ def main() -> None:
     watchall.add_argument("--include-drafts", action="store_true", help="Also review draft PRs")
     watchall.add_argument("--skip-author", action="append", help="Skip PRs by this author (repeatable)")
 
+    drift_p = sub.add_parser(
+        "docs-drift",
+        help="Tree-diff the converted docs source tree vs master (CI-friendly: exit 1 on drift)",
+    )
+    drift_p.add_argument("--repo-path", required=True, help="Path to a prebid.github.io checkout")
+    drift_p.add_argument(
+        "--since", help="Pinned converted-at SHA (default: merge-base of --ref and --converted-branch)"
+    )
+    drift_p.add_argument("--ref", default="master", help="Live branch to compare against (default master)")
+    drift_p.add_argument(
+        "--converted-branch",
+        default="docusaurus",
+        help="Branch holding the converted pages (default docusaurus)",
+    )
+    drift_p.add_argument(
+        "--source", action="append", help="Converted source path prefix (repeatable, default dev-docs/)"
+    )
+    drift_p.add_argument("--output", help="Save the drift report as JSON")
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -383,6 +446,8 @@ def main() -> None:
         cmd_watch(args)
     elif args.command == "watch-all":
         cmd_watch_all(args)
+    elif args.command == "docs-drift":
+        cmd_docs_drift(args)
     else:
         parser.print_help()
         sys.exit(1)
