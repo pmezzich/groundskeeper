@@ -148,6 +148,9 @@ def regenerate_and_check(repo_path: str | Path, rules: list[FreshnessRule]) -> l
 
 
 # Bundled manifests for known repos. A repo can also ship its own (load_rules).
+# Only list artifacts that are git-TRACKED: an untracked / generate-on-demand file
+# (salesagent's .agent-index/ is one) is never in a PR, so a rule for it would
+# fire on every source change — noise. Calibrated against 60 real salesagent PRs.
 SALESAGENT_RULES: list[FreshnessRule] = [
     FreshnessRule(
         id="frontend-types",
@@ -155,13 +158,6 @@ SALESAGENT_RULES: list[FreshnessRule] = [
         sources=["src/core/schemas/**"],
         generated=["static/js/generated-types.d.ts"],
         refresh="uv run python scripts/generate_frontend_types.py",
-    ),
-    FreshnessRule(
-        id="agent-index",
-        label="the AI agent symbol index",
-        sources=["src/core/tools/**"],
-        generated=[".agent-index/**"],
-        refresh="uv run python scripts/gen-agent-index.py",
     ),
     FreshnessRule(
         id="reference-formats",

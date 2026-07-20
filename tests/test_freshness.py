@@ -51,9 +51,9 @@ class TestCheckFreshness:
         assert check_freshness([_file("static/js/generated-types.d.ts")], [_RULE]) == []
 
     def test_rules_are_independent(self) -> None:
-        # Only the rule whose source changed fires (a tools change -> agent-index).
-        findings = check_freshness([_file("src/core/tools/products.py")], rules_for_repo("prebid/salesagent"))
-        assert [f.rule_id for f in findings] == ["freshness/agent-index"]
+        # Only the rule whose source changed fires (a schema change -> frontend-types).
+        findings = check_freshness([_file("src/core/schemas/product.py")], rules_for_repo("prebid/salesagent"))
+        assert [f.rule_id for f in findings] == ["freshness/frontend-types"]
 
 
 class TestGlobMatching:
@@ -71,7 +71,7 @@ class TestGlobMatching:
 class TestManifests:
     def test_salesagent_bundle_has_rules(self) -> None:
         rules = rules_for_repo("prebid/salesagent")
-        assert {r.id for r in rules} == {"frontend-types", "agent-index", "reference-formats"}
+        assert {r.id for r in rules} == {"frontend-types", "reference-formats"}
 
     def test_unknown_repo_has_no_rules(self) -> None:
         assert rules_for_repo("prebid/prebid.js") == []
