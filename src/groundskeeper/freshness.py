@@ -21,6 +21,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import subprocess
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -36,6 +37,17 @@ class FreshnessRule(BaseModel):
     sources: list[str] = Field(default_factory=list)  # globs: the source of truth
     generated: list[str] = Field(default_factory=list)  # globs: the derived artifact
     refresh: str  # the command that regenerates the artifact
+
+
+class StaleArtifact(BaseModel):
+    """A generated artifact whose committed copy differs from a fresh regen."""
+
+    rule_id: str
+    label: str
+    generated: list[str] = Field(default_factory=list)
+    refresh: str
+    changes: str = ""  # `git status --porcelain` of the generated paths after regen
+    error: str | None = None  # set when the refresh command could not run
 
 
 def _matches(path: str, pattern: str) -> bool:
@@ -81,6 +93,58 @@ def check_freshness(files: list[FileDiff], rules: list[FreshnessRule]) -> list[F
             )
         )
     return findings
+
+
+def _restore(repo: Path, paths: list[str]) -> None:
+    """Undo a regen: revert tracked changes and remove newly-created files."""
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", *paths], capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "clean", "-fdq", "--", *paths], capture_output=True, text=True)
+
+
+def regenerate_and_check(repo_path: str | Path, rules: list[FreshnessRule]) -> list[StaleArtifact]:
+    """Ground-truth staleness: run each refresh command, diff the generated
+    artifact against what's committed, then restore the tree.
+
+    A non-empty diff means the checked-in copy is genuinely stale — stronger than
+    the per-PR heuristic (which only knows the source was touched). This is the
+    engine an auto-refresh sits on: the diff it captures IS the refresh. It runs
+    the manifest's commands, so point it only at repos whose manifest you trust,
+    on a clean working tree.
+    """
+    repo = Path(repo_path)
+    stale: list[StaleArtifact] = []
+    for rule in rules:
+        proc = subprocess.run(rule.refresh, cwd=str(repo), shell=True, capture_output=True, text=True)
+        if proc.returncode != 0:
+            _restore(repo, rule.generated)
+            tail = (proc.stderr or proc.stdout or "").strip()[-200:]
+            stale.append(
+                StaleArtifact(
+                    rule_id=rule.id,
+                    label=rule.label,
+                    generated=rule.generated,
+                    refresh=rule.refresh,
+                    error=f"refresh failed (exit {proc.returncode}): {tail}",
+                )
+            )
+            continue
+        changed = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain", "--", *rule.generated],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        _restore(repo, rule.generated)
+        if changed:
+            stale.append(
+                StaleArtifact(
+                    rule_id=rule.id,
+                    label=rule.label,
+                    generated=rule.generated,
+                    refresh=rule.refresh,
+                    changes=changed[:500],
+                )
+            )
+    return stale
 
 
 # Bundled manifests for known repos. A repo can also ship its own (load_rules).

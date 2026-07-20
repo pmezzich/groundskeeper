@@ -269,6 +269,41 @@ def cmd_watch_all(args: argparse.Namespace) -> None:
         console.print("[dim]dry-run: nothing posted. Re-run with --post to go live.[/dim]")
 
 
+def cmd_freshness(args: argparse.Namespace) -> None:
+    from rich.table import Table
+
+    from groundskeeper.freshness import load_rules, regenerate_and_check, rules_for_repo
+
+    rules = load_rules(args.manifest) if args.manifest else rules_for_repo(args.repo)
+    if not rules:
+        console.print(f"[yellow]No freshness rules for {args.manifest or args.repo}.[/yellow]")
+        return
+    console.print(f"[bold]Freshness[/bold] — regenerating {len(rules)} artifact(s) in {args.repo_path}")
+    stale = regenerate_and_check(args.repo_path, rules)
+    by_id = {s.rule_id: s for s in stale}
+
+    table = Table(title="Generated-artifact freshness")
+    table.add_column("Artifact", style="cyan")
+    table.add_column("Status")
+    table.add_column("Detail", overflow="fold")
+    for rule in rules:
+        s = by_id.get(rule.id)
+        if s is None:
+            table.add_row(rule.label, "[green]fresh[/green]", "")
+        elif s.error:
+            table.add_row(rule.label, "[yellow]could not run[/yellow]", s.error)
+        else:
+            first = s.changes.splitlines()[0] if s.changes else ""
+            table.add_row(rule.label, "[red]STALE[/red]", f"{first}  |  fix: {rule.refresh}")
+    console.print(table)
+
+    genuine = [s for s in stale if not s.error]
+    if genuine:
+        console.print(f"\n[red]{len(genuine)} artifact(s) out of date[/red] - run the refresh command(s).")
+        sys.exit(1)
+    console.print("\n[green]all generated artifacts are up to date[/green]")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="groundskeeper",
@@ -374,6 +409,14 @@ def main() -> None:
     watchall.add_argument("--include-drafts", action="store_true", help="Also review draft PRs")
     watchall.add_argument("--skip-author", action="append", help="Skip PRs by this author (repeatable)")
 
+    fresh_p = sub.add_parser(
+        "freshness",
+        help="Regenerate each artifact and report which are actually stale vs committed (exit 1 on stale)",
+    )
+    fresh_p.add_argument("--repo-path", required=True, help="Path to a repo checkout (clean working tree)")
+    fresh_p.add_argument("--repo", default=DEFAULT_REPO, help="Repo name for bundled freshness rules")
+    fresh_p.add_argument("--manifest", help="Path to a freshness JSON manifest (overrides --repo bundle)")
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -390,6 +433,8 @@ def main() -> None:
         cmd_watch(args)
     elif args.command == "watch-all":
         cmd_watch_all(args)
+    elif args.command == "freshness":
+        cmd_freshness(args)
     else:
         parser.print_help()
         sys.exit(1)

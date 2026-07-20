@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from groundskeeper.freshness import (
     FreshnessRule,
     check_freshness,
     load_rules,
+    regenerate_and_check,
     rules_for_repo,
 )
 from groundskeeper.models import FileDiff, Severity, VerdictStatus
@@ -82,3 +86,56 @@ class TestManifests:
         rules = load_rules(manifest)
         assert len(rules) == 1 and rules[0].id == "r1"
         assert len(check_freshness([_file("s/x.py")], rules)) == 1
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout
+
+
+class TestRegenerateAndCheck:
+    """The ground-truth engine: run the generator, diff vs committed, restore."""
+
+    def _repo(self, tmp_path: Path, committed: str, generator_writes: str) -> Path:
+        repo = tmp_path
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "t@t.t")
+        _git(repo, "config", "user.name", "t")
+        (repo / "src").mkdir()
+        (repo / "src" / "model.py").write_text("x = 1", encoding="utf-8")
+        (repo / "out.txt").write_text(committed, encoding="utf-8")
+        (repo / "gen.py").write_text(f"open('out.txt', 'w').write({generator_writes!r})", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "init")
+        return repo
+
+    def _rule(self) -> FreshnessRule:
+        return FreshnessRule(
+            id="out", label="out.txt", sources=["src/**"], generated=["out.txt"], refresh="python gen.py"
+        )
+
+    def test_detects_a_stale_artifact(self, tmp_path: Path) -> None:
+        repo = self._repo(tmp_path, "v1", "v2")  # generator output differs from committed
+        stale = regenerate_and_check(repo, [self._rule()])
+        assert len(stale) == 1
+        assert stale[0].rule_id == "out" and stale[0].error is None
+        assert "out.txt" in stale[0].changes
+        # working tree restored to the committed state
+        assert (repo / "out.txt").read_text(encoding="utf-8") == "v1"
+        assert _git(repo, "status", "--porcelain").strip() == ""
+
+    def test_fresh_artifact_is_clean(self, tmp_path: Path) -> None:
+        repo = self._repo(tmp_path, "v1", "v1")  # generator reproduces the committed copy
+        assert regenerate_and_check(repo, [self._rule()]) == []
+        assert _git(repo, "status", "--porcelain").strip() == ""
+
+    def test_generator_failure_is_reported_not_raised(self, tmp_path: Path) -> None:
+        repo = self._repo(tmp_path, "v1", "v1")
+        bad = FreshnessRule(
+            id="bad",
+            label="bad",
+            sources=["src/**"],
+            generated=["out.txt"],
+            refresh='python -c "import sys; sys.exit(3)"',
+        )
+        stale = regenerate_and_check(repo, [bad])
+        assert len(stale) == 1 and stale[0].error is not None and "exit 3" in stale[0].error
