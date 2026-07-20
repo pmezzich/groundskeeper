@@ -95,7 +95,14 @@ def _run_review(args: argparse.Namespace) -> tuple[str, int, list[Finding], str]
     console.print(f"  {len(rules)} rules compiled")
 
     findings = run_deterministic_checks(pr.files)
-    console.print(f"  deterministic checks: {len(findings)} finding(s)")
+    from groundskeeper.freshness import check_freshness, rules_for_repo
+
+    freshness = check_freshness(pr.files, rules_for_repo(repo))
+    findings.extend(freshness)
+    note = f"  deterministic checks: {len(findings)} finding(s)"
+    if freshness:
+        note += f" (incl. {len(freshness)} stale-artifact)"
+    console.print(note)
 
     if args.no_llm:
         console.print("[yellow]--no-llm: skipping semantic judge[/yellow]")
