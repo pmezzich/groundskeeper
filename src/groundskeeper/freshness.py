@@ -50,6 +50,19 @@ class StaleArtifact(BaseModel):
     error: str | None = None  # set when the refresh command could not run
 
 
+class RefreshResult(BaseModel):
+    """Outcome of the auto-update loop for one rule."""
+
+    rule_id: str
+    label: str
+    stale: bool = False
+    diffstat: str = ""
+    branch: str = ""  # branch the refresh was committed to (commit / pr mode)
+    committed: bool = False
+    pr_url: str = ""  # the PR opened (pr mode)
+    error: str | None = None
+
+
 def _matches(path: str, pattern: str) -> bool:
     """Glob match with ``**`` meaning 'any characters, including /'."""
     if "**" in pattern:
@@ -95,10 +108,18 @@ def check_freshness(files: list[FileDiff], rules: list[FreshnessRule]) -> list[F
     return findings
 
 
+def _git(repo: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=check)
+
+
+def _current_branch(repo: Path) -> str:
+    return _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+
 def _restore(repo: Path, paths: list[str]) -> None:
     """Undo a regen: revert tracked changes and remove newly-created files."""
-    subprocess.run(["git", "-C", str(repo), "checkout", "--", *paths], capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(repo), "clean", "-fdq", "--", *paths], capture_output=True, text=True)
+    _git(repo, "checkout", "--", *paths)
+    _git(repo, "clean", "-fdq", "--", *paths)
 
 
 def regenerate_and_check(repo_path: str | Path, rules: list[FreshnessRule]) -> list[StaleArtifact]:
@@ -145,6 +166,87 @@ def regenerate_and_check(repo_path: str | Path, rules: list[FreshnessRule]) -> l
                 )
             )
     return stale
+
+
+def auto_refresh(
+    repo_path: str | Path,
+    rules: list[FreshnessRule],
+    *,
+    mode: str = "report",
+    repo_slug: str | None = None,
+    head_owner: str | None = None,
+    remote: str = "origin",
+) -> list[RefreshResult]:
+    """The auto-update loop — close the gap the watcher opens.
+
+    For each rule, regenerate and check whether the committed artifact is stale.
+    For the stale ones:
+
+    - ``report`` (default): capture what would change, restore the tree — a
+      preview, nothing written.
+    - ``commit``: create ``groundskeeper/refresh-<id>`` off the current branch
+      and commit the regenerated artifact there (local only).
+    - ``pr``: also ``git push`` the branch and ``gh pr create`` it (needs
+      ``repo_slug``; ``head_owner`` sets a fork head like ``pmezzich:branch``).
+
+    Only ``pr`` is outward-facing; ``report``/``commit`` stay on the machine. The
+    default is a preview so the loop never opens a PR unless asked.
+    """
+    repo = Path(repo_path)
+    base = _current_branch(repo)
+    results: list[RefreshResult] = []
+    for rule in rules:
+        proc = subprocess.run(rule.refresh, cwd=str(repo), shell=True, capture_output=True, text=True)
+        if proc.returncode != 0:
+            _restore(repo, rule.generated)
+            tail = (proc.stderr or proc.stdout or "").strip()[-200:]
+            results.append(
+                RefreshResult(rule_id=rule.id, label=rule.label, error=f"refresh failed: {tail}")
+            )
+            continue
+        changed = _git(repo, "status", "--porcelain", "--", *rule.generated).stdout.strip()
+        _restore(repo, rule.generated)
+        if not changed:
+            results.append(RefreshResult(rule_id=rule.id, label=rule.label, stale=False))
+            continue
+
+        res = RefreshResult(rule_id=rule.id, label=rule.label, stale=True, diffstat=changed[:500])
+        if mode in ("commit", "pr"):
+            branch = f"groundskeeper/refresh-{rule.id}"
+            _git(repo, "checkout", "-B", branch, base, check=True)
+            subprocess.run(rule.refresh, cwd=str(repo), shell=True, capture_output=True, text=True)
+            _git(repo, "add", "--", *rule.generated)
+            _git(
+                repo,
+                "commit",
+                "-m",
+                f"chore: refresh {rule.label}",
+                "-m",
+                f"`{rule.label}` drifted from its source of truth; regenerated with `{rule.refresh}`.",
+                check=True,
+            )
+            res.branch = branch
+            res.committed = True
+            if mode == "pr" and repo_slug:
+                _git(repo, "push", "-u", remote, branch, check=True)
+                head = f"{head_owner}:{branch}" if head_owner else branch
+                pr = subprocess.run(
+                    [
+                        "gh", "pr", "create", "--repo", repo_slug, "--head", head, "--base", base,
+                        "--title", f"chore: refresh {rule.label}",
+                        "--body", f"Automated by `groundskeeper freshness`: {rule.label} drifted from "
+                        f"its source of truth. Regenerated with `{rule.refresh}`.",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if pr.returncode == 0:
+                    res.pr_url = (pr.stdout or "").strip().splitlines()[-1] if pr.stdout.strip() else ""
+                else:
+                    res.error = f"gh pr create failed: {(pr.stderr or '').strip()[-200:]}"
+            _git(repo, "checkout", base, check=True)
+        results.append(res)
+    return results
 
 
 # Bundled manifests for known repos. A repo can also ship its own (load_rules).

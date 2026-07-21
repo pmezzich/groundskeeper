@@ -272,36 +272,48 @@ def cmd_watch_all(args: argparse.Namespace) -> None:
 def cmd_freshness(args: argparse.Namespace) -> None:
     from rich.table import Table
 
-    from groundskeeper.freshness import load_rules, regenerate_and_check, rules_for_repo
+    from groundskeeper.freshness import auto_refresh, load_rules, rules_for_repo
 
     rules = load_rules(args.manifest) if args.manifest else rules_for_repo(args.repo)
     if not rules:
         console.print(f"[yellow]No freshness rules for {args.manifest or args.repo}.[/yellow]")
         return
-    console.print(f"[bold]Freshness[/bold] — regenerating {len(rules)} artifact(s) in {args.repo_path}")
-    stale = regenerate_and_check(args.repo_path, rules)
-    by_id = {s.rule_id: s for s in stale}
+    mode = "pr" if args.open_pr else "commit" if args.fix else "report"
+    console.print(f"[bold]Freshness[/bold] ({mode}) - {len(rules)} artifact(s) in {args.repo_path}")
+    results = auto_refresh(
+        args.repo_path,
+        rules,
+        mode=mode,
+        repo_slug=args.repo if args.open_pr else None,
+        head_owner=args.head_owner,
+    )
 
     table = Table(title="Generated-artifact freshness")
     table.add_column("Artifact", style="cyan")
     table.add_column("Status")
     table.add_column("Detail", overflow="fold")
-    for rule in rules:
-        s = by_id.get(rule.id)
-        if s is None:
-            table.add_row(rule.label, "[green]fresh[/green]", "")
-        elif s.error:
-            table.add_row(rule.label, "[yellow]could not run[/yellow]", s.error)
+    for r in results:
+        if r.error:
+            table.add_row(r.label, "[yellow]could not run[/yellow]", r.error)
+        elif not r.stale:
+            table.add_row(r.label, "[green]fresh[/green]", "")
+        elif r.pr_url:
+            table.add_row(r.label, "[green]PR opened[/green]", r.pr_url)
+        elif r.committed:
+            table.add_row(r.label, "[cyan]refreshed[/cyan]", f"committed to {r.branch}")
         else:
-            first = s.changes.splitlines()[0] if s.changes else ""
-            table.add_row(rule.label, "[red]STALE[/red]", f"{first}  |  fix: {rule.refresh}")
+            table.add_row(r.label, "[red]STALE[/red]", (r.diffstat.splitlines()[0] if r.diffstat else ""))
     console.print(table)
 
-    genuine = [s for s in stale if not s.error]
-    if genuine:
-        console.print(f"\n[red]{len(genuine)} artifact(s) out of date[/red] - run the refresh command(s).")
+    stale = [r for r in results if r.stale and not r.error]
+    if not stale:
+        console.print("\n[green]all generated artifacts are up to date[/green]")
+        return
+    if mode == "report":
+        console.print(f"\n[red]{len(stale)} out of date[/red] - use --fix or --open-pr.")
         sys.exit(1)
-    console.print("\n[green]all generated artifacts are up to date[/green]")
+    tail = "and opened PR(s)" if mode == "pr" else "on local refresh branch(es)"
+    console.print(f"\n[green]refreshed {len(stale)} artifact(s)[/green] {tail}")
 
 
 def main() -> None:
@@ -414,8 +426,15 @@ def main() -> None:
         help="Regenerate each artifact and report which are actually stale vs committed (exit 1 on stale)",
     )
     fresh_p.add_argument("--repo-path", required=True, help="Path to a repo checkout (clean working tree)")
-    fresh_p.add_argument("--repo", default=DEFAULT_REPO, help="Repo name for bundled freshness rules")
+    fresh_p.add_argument("--repo", default=DEFAULT_REPO, help="Repo for bundled rules / PR target")
     fresh_p.add_argument("--manifest", help="Path to a freshness JSON manifest (overrides --repo bundle)")
+    fresh_p.add_argument(
+        "--fix", action="store_true", help="Commit each refresh to a local refresh-* branch"
+    )
+    fresh_p.add_argument(
+        "--open-pr", action="store_true", help="Push the branch and open a PR (--repo is the target)"
+    )
+    fresh_p.add_argument("--head-owner", help="Fork owner for the PR head (e.g. pmezzich)")
 
     args = parser.parse_args()
     logging.basicConfig(

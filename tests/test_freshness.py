@@ -7,6 +7,7 @@ from pathlib import Path
 
 from groundskeeper.freshness import (
     FreshnessRule,
+    auto_refresh,
     check_freshness,
     load_rules,
     regenerate_and_check,
@@ -52,7 +53,8 @@ class TestCheckFreshness:
 
     def test_rules_are_independent(self) -> None:
         # Only the rule whose source changed fires (a schema change -> frontend-types).
-        findings = check_freshness([_file("src/core/schemas/product.py")], rules_for_repo("prebid/salesagent"))
+        files = [_file("src/core/schemas/product.py")]
+        findings = check_freshness(files, rules_for_repo("prebid/salesagent"))
         assert [f.rule_id for f in findings] == ["freshness/frontend-types"]
 
 
@@ -139,3 +141,49 @@ class TestRegenerateAndCheck:
         )
         stale = regenerate_and_check(repo, [bad])
         assert len(stale) == 1 and stale[0].error is not None and "exit 3" in stale[0].error
+
+
+class TestAutoRefresh:
+    """The auto-update loop: report (preview) / commit (local refresh branch)."""
+
+    def _repo(self, tmp_path: Path, committed: str, generator_writes: str) -> Path:
+        repo = tmp_path
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "t@t.t")
+        _git(repo, "config", "user.name", "t")
+        (repo / "src").mkdir()
+        (repo / "src" / "model.py").write_text("x = 1", encoding="utf-8")
+        (repo / "out.txt").write_text(committed, encoding="utf-8")
+        (repo / "gen.py").write_text(f"open('out.txt', 'w').write({generator_writes!r})", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "init")
+        return repo
+
+    def _rule(self) -> FreshnessRule:
+        return FreshnessRule(
+            id="out", label="out.txt", sources=["src/**"], generated=["out.txt"], refresh="python gen.py"
+        )
+
+    def test_report_mode_previews_without_writing(self, tmp_path: Path) -> None:
+        repo = self._repo(tmp_path, "v1", "v2")
+        (r,) = auto_refresh(repo, [self._rule()], mode="report")
+        assert r.stale and not r.committed and not r.branch
+        assert (repo / "out.txt").read_text(encoding="utf-8") == "v1"  # untouched
+        assert _git(repo, "status", "--porcelain").strip() == ""
+
+    def test_commit_mode_opens_a_refresh_branch(self, tmp_path: Path) -> None:
+        repo = self._repo(tmp_path, "v1", "v2")
+        base = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        (r,) = auto_refresh(repo, [self._rule()], mode="commit")
+        assert r.stale and r.committed and r.branch == "groundskeeper/refresh-out"
+        # returned to a clean base with the original content intact
+        assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == base
+        assert (repo / "out.txt").read_text(encoding="utf-8") == "v1"
+        assert _git(repo, "status", "--porcelain").strip() == ""
+        # the refresh branch carries the regenerated artifact
+        assert _git(repo, "show", "groundskeeper/refresh-out:out.txt").strip() == "v2"
+
+    def test_fresh_artifact_needs_no_branch(self, tmp_path: Path) -> None:
+        repo = self._repo(tmp_path, "v1", "v1")
+        (r,) = auto_refresh(repo, [self._rule()], mode="commit")
+        assert not r.stale and not r.committed and not r.branch
